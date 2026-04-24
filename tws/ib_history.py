@@ -14,12 +14,12 @@ NY = pytz.timezone("America/New_York")
 @dataclass
 class IBHistoryConfig:
     host: str = "127.0.0.1"
-    port: int = 7497          # TWS paper default
+    port: int = 7497
     client_id: int = 21
-    use_rth: bool = True      # Regular Trading Hours only
+    use_rth: bool = True
     bar_size: str = "1 min"
     what_to_show: str = "TRADES"
-    chunk_days: int = 1       # safest for pacing
+    chunk_days: int = 1
 
 
 class IBKRHistoryClient:
@@ -34,7 +34,12 @@ class IBKRHistoryClient:
 
     def connect(self) -> None:
         if not self.ib.isConnected():
-            self.ib.connect(self.cfg.host, self.cfg.port, clientId=self.cfg.client_id)
+            self.ib.connect(
+                self.cfg.host,
+                self.cfg.port,
+                clientId=self.cfg.client_id,
+                timeout=20,
+            )
 
     def disconnect(self) -> None:
         if self.ib.isConnected():
@@ -50,11 +55,9 @@ class IBKRHistoryClient:
     ) -> pd.DataFrame:
         """
         Fetch 1-minute bars between [start, end] by walking backwards in chunk_days.
-        Returns DataFrame with:
-          timestamp (UTC), open, high, low, close, volume
-        Compatible with your strategy/backtest (which expects timestamp in UTC).
+        Returns DataFrame with columns: timestamp (UTC), open, high, low, close, volume.
+        endDateTime is sent as explicit UTC (yyyymmdd-HH:MM:SS) to avoid IBKR warning 2174.
         """
-
         if start.tzinfo is None:
             start = NY.localize(start)
         else:
@@ -66,7 +69,9 @@ class IBKRHistoryClient:
             end = end.astimezone(NY)
 
         if end <= start:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
 
         self.connect()
 
@@ -78,10 +83,12 @@ class IBKRHistoryClient:
 
         while cur_end > start:
             cur_start = max(start, cur_end - timedelta(days=self.cfg.chunk_days))
-
             dur_days = max((cur_end - cur_start).days, 1)
             duration_str = f"{dur_days} D"
-            end_str = cur_end.strftime("%Y%m%d %H:%M:%S")
+
+            # Use explicit UTC format to suppress IBKR warning 2174
+            cur_end_utc = cur_end.astimezone(pytz.UTC)
+            end_str = cur_end_utc.strftime("%Y%m%d-%H:%M:%S")
 
             bars = self.ib.reqHistoricalData(
                 contract,
@@ -94,21 +101,21 @@ class IBKRHistoryClient:
                 keepUpToDate=False,
             )
 
-            df = util.df(bars)  # date, open, high, low, close, volume, ...
+            df = util.df(bars)
             if not df.empty:
                 df = df.rename(columns={"date": "timestamp"})
                 chunks.append(df)
 
-            cur_end = cur_start  # step back
+            cur_end = cur_start
 
         if not chunks:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
 
         out = pd.concat(chunks, ignore_index=True)
-
-        # Timestamps: ib_insync often returns tz-naive local time -> assume NY then convert to UTC
-        ts = pd.to_datetime(out["timestamp"], errors="coerce")
         out = out.dropna(subset=["timestamp"])
+
         ts = pd.to_datetime(out["timestamp"], errors="coerce")
 
         if getattr(ts.dt, "tz", None) is None:
@@ -117,8 +124,11 @@ class IBKRHistoryClient:
             ts = ts.dt.tz_convert(NY)
 
         out["timestamp"] = ts.dt.tz_convert(pytz.UTC)
-
         out = out[["timestamp", "open", "high", "low", "close", "volume"]]
-        out = out.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        out = (
+            out.drop_duplicates(subset=["timestamp"])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
         return out

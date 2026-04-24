@@ -3,19 +3,15 @@ import pandas as pd
 
 
 def max_drawdown(equity: np.ndarray) -> float:
-    peak = equity[0]
-    mdd = 0.0
-    for v in equity:
-        if v > peak:
-            peak = v
-        dd = v - peak
-        if dd < mdd:
-            mdd = dd
-    return float(mdd)
+    if len(equity) == 0:
+        return 0.0
+    # FIX: vectorised NumPy instead of Python loop
+    running_max = np.maximum.accumulate(equity)
+    return float((equity - running_max).min())
 
 
 def longest_losing_streak(results: np.ndarray) -> int:
-    # treat <0 as loss, 0 as not-loss (BE resets streak)
+    # treat result < 0 as loss; 0 (BE) resets streak
     streak = 0
     best = 0
     for r in results:
@@ -29,15 +25,18 @@ def longest_losing_streak(results: np.ndarray) -> int:
 
 def run_monte_carlo(
     results_r: np.ndarray,
-    n_sims: int = 10000,
+    n_sims: int = 10_000,
     sample_with_replacement: bool = True,
     seed: int | None = 42,
 ) -> pd.DataFrame:
     """
     Monte Carlo over trade sequence.
-    - with replacement: bootstrap (assumes IID trades)
+    - with replacement : bootstrap (assumes IID trades)
     - without replacement: random permutation (same trades, different order)
     """
+    if len(results_r) == 0:
+        raise ValueError("results_r is empty — nothing to simulate")
+
     rng = np.random.default_rng(seed)
     n = len(results_r)
     out = []
@@ -49,9 +48,9 @@ def run_monte_carlo(
             sim = results_r.copy()
             rng.shuffle(sim)
 
-        equity = np.cumsum(sim)
-        mdd = max_drawdown(np.insert(equity, 0, 0.0))  # include starting 0
-        final_r = float(equity[-1]) if n > 0 else 0.0
+        equity = np.insert(np.cumsum(sim), 0, 0.0)  # include starting 0
+        mdd = max_drawdown(equity)
+        final_r = float(equity[-1])
         ll = longest_losing_streak(sim)
 
         out.append((final_r, mdd, ll))
@@ -61,10 +60,12 @@ def run_monte_carlo(
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     qs = [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
-    summary = pd.DataFrame({
-        "final_r": df["final_r"].quantile(qs),
-        "max_drawdown_r": df["max_drawdown_r"].quantile(qs),
-        "max_losing_streak": df["max_losing_streak"].quantile(qs),
-    })
-    summary.index = [f"p{int(q*100):02d}" for q in qs]
+    summary = pd.DataFrame(
+        {
+            "final_r": df["final_r"].quantile(qs),
+            "max_drawdown_r": df["max_drawdown_r"].quantile(qs),
+            "max_losing_streak": df["max_losing_streak"].quantile(qs),
+        }
+    )
+    summary.index = [f"p{int(q * 100):02d}" for q in qs]
     return summary

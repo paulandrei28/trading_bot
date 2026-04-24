@@ -5,6 +5,7 @@ from ibapi.order import Order
 import threading
 import time
 
+
 class VerboseOrderTestApp(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
@@ -25,7 +26,9 @@ class VerboseOrderTestApp(EWrapper, EClient):
     # Account callbacks
     # -----------------------------
     def accountSummary(self, reqId, account, tag, value, currency):
-        print(f"[ACCOUNT] ReqId:{reqId}, Account:{account}, Tag:{tag}, Value:{value}, Currency:{currency}")
+        print(
+            f"[ACCOUNT] ReqId:{reqId}, Account:{account}, Tag:{tag}, Value:{value}, Currency:{currency}"
+        )
 
     def accountSummaryEnd(self, reqId):
         print(f"[ACCOUNT] Account summary end. ReqId:{reqId}")
@@ -42,15 +45,33 @@ class VerboseOrderTestApp(EWrapper, EClient):
     # -----------------------------
     # Order callbacks
     # -----------------------------
-    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
-                    permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
-        print(f"[ORDER STATUS] OrderId:{orderId}, Status:{status}, Filled:{filled}, AvgFill:{avgFillPrice}")
+    def orderStatus(
+        self,
+        orderId,
+        status,
+        filled,
+        remaining,
+        avgFillPrice,
+        permId,
+        parentId,
+        lastFillPrice,
+        clientId,
+        whyHeld,
+        mktCapPrice,
+    ):
+        print(
+            f"[ORDER STATUS] OrderId:{orderId}, Status:{status}, Filled:{filled}, AvgFill:{avgFillPrice}"
+        )
 
     def openOrder(self, orderId, contract, order, orderState):
-        print(f"[OPEN ORDER] OrderId:{orderId}, {contract.symbol} {order.action} {order.totalQuantity} at {order.lmtPrice}")
+        print(
+            f"[OPEN ORDER] OrderId:{orderId}, {contract.symbol} {order.action} {order.totalQuantity} at {order.lmtPrice}"
+        )
 
     def execDetails(self, reqId, contract, execution):
-        print(f"[EXECUTION] ReqId:{reqId}, {contract.symbol} {execution.side} {execution.shares} at {execution.price}")
+        print(
+            f"[EXECUTION] ReqId:{reqId}, {contract.symbol} {execution.side} {execution.shares} at {execution.price}"
+        )
 
     def error(self, reqId, errorCode, errorString):
         print(f"[ERROR] Id:{reqId}, Code:{errorCode}, Msg:{errorString}")
@@ -97,9 +118,11 @@ class VerboseOrderTestApp(EWrapper, EClient):
         self.placeOrder(self.nextOrderId + 2, contract, tp_order)
         print("[INFO] Bracket orders submitted (simulated)")
 
+
 def run_loop(app):
     print("[INFO] Starting API event loop")
     app.run()
+
 
 # -----------------------------
 # Connect to TWS / IB Gateway
