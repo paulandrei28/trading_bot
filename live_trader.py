@@ -65,7 +65,8 @@ class LiveConfig:
     SESSION_START = "09:30"  # NY market open
     OPENING_END = "09:35"  # end of opening range window
     TRADE_START = "10:00"  # earliest entry time
-    TRADE_END = "15:00"  # latest entry / session cutoff
+    TRADE_END = "15:00"    # latest NEW entry — scan loop exits here
+    HARD_CLOSE = "16:00"   # monitoring hard stop — cancel remaining legs here
     RR = 3.0  # reward:risk ratio
     WARMUP_DAYS = 30  # days of history for OR/ATR filters
 
@@ -229,7 +230,6 @@ def get_today_or_atr(
 ) -> tuple[Optional[float], Optional[float]]:
     """Fetch today's bars (09:30-09:35) to compute today's OR width and ATR."""
     today_start = NY.localize(datetime.combine(today, to_time(cfg.SESSION_START)))
-    today_or_end = NY.localize(datetime.combine(today, to_time(cfg.OPENING_END)))
     today_end = now_ny()
 
     log.debug("[FILTER] Fetching today's bars for OR/ATR computation...")
@@ -264,12 +264,6 @@ def get_today_or_atr(
         ],
         axis=1,
     ).max(axis=1)
-
-    # Use warmup ATR if today doesn't have 14 bars yet, else compute
-    if len(daily) > 0:
-        hist_atr = daily["atr_14"].quantile(cfg.ATR_Q_THRESH)
-    else:
-        hist_atr = None
 
     atr_today = (
         float(tr.rolling(14).mean().dropna().iloc[-1]) if len(tr) >= 14 else None
@@ -356,7 +350,8 @@ def main() -> None:
         f"  Port      : {config.port}  (paper={config.PORT_PAPER} / live={config.PORT_LIVE})"
     )
     log.info(f"  Risk/trade: ${config.RISK_USD}")
-    log.info(f"  Session   : {config.SESSION_START} - {config.TRADE_END} NY")
+    log.info(f"  Session   : {config.SESSION_START} - {config.TRADE_END} NY  (entries)")
+    log.info(f"  Monitoring: until {config.HARD_CLOSE} NY  (open trade hard close)")
     log.info(f"  Trade win : {config.TRADE_START} - {config.TRADE_END} NY")
     log.info(f"  Script started at: {started_at_str} NY")
     log.info("=" * 65)
@@ -365,6 +360,14 @@ def main() -> None:
     opening_end_t = to_time(config.OPENING_END)
     trade_start_t = to_time(config.TRADE_START)
     trade_end_t = to_time(config.TRADE_END)
+    hard_close_t = to_time(config.HARD_CLOSE)
+
+    # ── Weekend guard ──────────────────────────────────────────────────────────
+    if started_at_dt.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        day_name = started_at_dt.strftime("%A")
+        log.info(f"[WEEKEND] Today is {day_name}. US equity markets are closed. Exiting.")
+        _session_summary(log, config, trade_placed=False)
+        return
 
     # ── PRE-MARKET wait ────────────────────────────────────────────────────────
     while now_ny().time() < session_start_t:
@@ -524,7 +527,10 @@ def main() -> None:
     # ── Main scan loop ─────────────────────────────────────────────────────────
     log.info(f"[LOOP] Entering intraday scanning loop.")
     log.info(
-        f"[LOOP] Will scan for FVG setups from {config.TRADE_START} to {config.TRADE_END} NY."
+        f"[LOOP] New entries allowed from {config.TRADE_START} to {config.TRADE_END} NY."
+    )
+    log.info(
+        f"[LOOP] Open trades monitored until hard close at {config.HARD_CLOSE} NY."
     )
 
     trade_placed = False
@@ -538,22 +544,12 @@ def main() -> None:
             now = now_ny()
             now_t = now.time()
 
-            # Session end
+            # 15:00 — no new entries allowed; scan loop exits here
             if now_t >= trade_end_t:
                 log.info(
-                    f"[SESSION END] {config.TRADE_END} NY reached. Ending session."
+                    f"[SESSION END] {config.TRADE_END} NY reached. "
+                    f"No new entries. Scan loop ending."
                 )
-                if trade_placed and trade_result is None:
-                    log.info(
-                        "[SESSION END] Trade was open at session end — marking as OPEN."
-                    )
-                    record_trade_result(
-                        symbol=config.SYMBOL,
-                        result="OPEN",
-                        result_r=0.0,
-                        pnl_usd=0.0,
-                        note="Session ended before trade closed",
-                    )
                 break
 
             # TRADE WINDOW wait
@@ -650,7 +646,6 @@ def main() -> None:
                 continue
 
             qty = max(1, math.floor(config.RISK_USD / risk_per_share))
-            pnl_per_r = qty * risk_per_share
             log.info(
                 f"[SIGNAL] Risk: ${risk_per_share:.2f}/share  "
                 f"Qty: {qty}  Max loss: ${qty * risk_per_share:.2f}  "
@@ -691,28 +686,72 @@ def main() -> None:
                 atr_14=effective_atr,
             )
 
-            # Monitor until session end
+            # ── Monitoring loop ────────────────────────────────────────────────
+            # 15:00 only blocks NEW entries (scan loop above).
+            # This loop keeps watching an already-live trade until:
+            #   - target fills  -> WIN
+            #   - stop fills    -> LOSS
+            #   - 16:00 reached -> cancel remaining legs, mark OPEN
             log.info(
-                f"[MONITORING] Trade is live. Monitoring until {config.TRADE_END} NY..."
+                f"[MONITORING] Trade is live. Monitoring until fill or "
+                f"hard close at {config.HARD_CLOSE} NY..."
             )
+            past_cutoff_logged = False
+
             while True:
                 now = now_ny()
                 now_t = now.time()
 
-                if now_t >= trade_end_t:
-                    log.info("[MONITORING] Session cutoff reached.")
+                # Inform once when we cross 15:00 — but keep watching
+                if now_t >= trade_end_t and not past_cutoff_logged:
+                    log.info(
+                        f"[MONITORING] Past {config.TRADE_END} NY -- trade entered before "
+                        f"cutoff, continuing to monitor until fill or hard close "
+                        f"at {config.HARD_CLOSE} NY."
+                    )
+                    past_cutoff_logged = True
+
+                # Hard close at 16:00 — cancel remaining legs and exit
+                if now_t >= hard_close_t:
+                    log.info(
+                        f"[MONITORING] Hard close at {config.HARD_CLOSE} NY reached. "
+                        f"Cancelling remaining open legs..."
+                    )
+                    try:
+                        exec_client.cancel_order(stop_id)
+                        log.info(f"[MONITORING] Cancelled stop order {stop_id}.")
+                    except Exception as e:
+                        log.warning(f"[MONITORING] Could not cancel stop {stop_id}: {e}")
+                    try:
+                        exec_client.cancel_order(target_id)
+                        log.info(f"[MONITORING] Cancelled target order {target_id}.")
+                    except Exception as e:
+                        log.warning(f"[MONITORING] Could not cancel target {target_id}: {e}")
+
+                    record_trade_result(
+                        symbol=config.SYMBOL,
+                        result="OPEN",
+                        result_r=0.0,
+                        pnl_usd=0.0,
+                        note=f"Hard close at {config.HARD_CLOSE} -- trade still open at market close",
+                    )
+                    log.info(
+                        "[MONITORING] Trade marked OPEN "
+                        "(not resolved before market close)."
+                    )
+                    trade_result = "OPEN"
                     break
 
-                order_status = exec_client._orders.get(entry_id, "")
-                log.debug(
-                    f"[MONITORING] Order {entry_id} status: {order_status or 'pending'}"
-                )
-
-                # Check if stop or target filled via order status callbacks
+                # Check order fills via status callbacks
                 stop_status = exec_client._orders.get(stop_id, "")
                 target_status = exec_client._orders.get(target_id, "")
 
-                if target_status in ("Filled",):
+                log.debug(
+                    f"[MONITORING] stop={stop_status or 'pending'}  "
+                    f"target={target_status or 'pending'}"
+                )
+
+                if target_status == "Filled":
                     result_r = config.RR
                     pnl_usd = qty * risk_per_share * config.RR
                     log.info(
@@ -722,10 +761,12 @@ def main() -> None:
                     trade_result = "WIN"
                     break
 
-                if stop_status in ("Filled",):
+                if stop_status == "Filled":
                     result_r = -1.0
                     pnl_usd = -qty * risk_per_share
-                    log.info(f"[RESULT] STOP HIT -- {result_r:.2f}R  ${pnl_usd:.2f}")
+                    log.info(
+                        f"[RESULT] STOP HIT -- {result_r:.2f}R  ${pnl_usd:.2f}"
+                    )
                     record_trade_result(config.SYMBOL, "LOSS", result_r, pnl_usd)
                     trade_result = "LOSS"
                     break
