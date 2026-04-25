@@ -3,3 +3,5 @@ numpy
 pytz
 ibapi
 ib_insync
+flask
+flask-socketio
