@@ -1,199 +1,206 @@
 from __future__ import annotations
 
-import threading
-import logging
 from typing import Optional
 
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
-from ibapi.order import Order
+from ib_insync import IB, Stock, Order, Trade, LimitOrder, StopOrder, util
 
-log = logging.getLogger("ib_execution")
+import logging
+
+log = logging.getLogger("live_trader")
 
 
-class IBExecution(EWrapper, EClient):
+class IBKRExecutionClient:
     """
-    Thin execution wrapper around ibapi EClient/EWrapper.
-    Handles bracket order placement and order status callbacks.
+    Handles live/paper bracket order placement and monitoring via ib_insync.
 
-    error() uses *args to stay compatible with both the classic ibapi
-    callback signature (req_id, error_code, error_string) and the newer
-    protobuf-based signature (req_id, error_time, error_code, error_string,
-    advanced_order_reject) without raising TypeError at runtime.
+    Usage:
+        client = IBKRExecutionClient(port=7497, client_id=20)
+        client.connect()
+        parent_id = client.place_bracket_order(
+            symbol="QQQ", action="BUY", quantity=10,
+            entry_price=480.50, stop_price=479.66, target_price=482.90
+        )
+        status = client.get_order_status(parent_id)
+        client.disconnect()
     """
 
-    def __init__(self):
-        EClient.__init__(self, self)
-        self.next_order_id: Optional[int] = None
-        self._ready = threading.Event()
-        self._orders: dict = {}
+    def __init__(self, port: int = 7497, client_id: int = 20) -> None:
+        self.port = port
+        self.client_id = client_id
+        self.ib = IB()
+        self._trades: dict[int, Trade] = {}  # parent_id → Trade
 
-    def connect_and_run(self, host: str, port: int, client_id: int) -> None:
-        self.connect(host, port, client_id)
-        thread = threading.Thread(target=self.run, daemon=True)
-        thread.start()
-        if not self._ready.wait(timeout=10):
-            raise ConnectionError(
-                f"Could not connect to TWS at {host}:{port} within 10 s. "
-                "Make sure TWS is open and API connections are enabled."
-            )
-        log.info(f"Connected to IBKR ({host}:{port}  client_id={client_id})")
+    # ──────────────────────────────────────────────────────────────
+    # Connection
+    # ──────────────────────────────────────────────────────────────
 
-    def disconnect_safe(self) -> None:
-        try:
-            self.disconnect()
-        except Exception:
-            pass
+    def connect(self) -> None:
+        if not self.ib.isConnected():
+            self.ib.connect("127.0.0.1", self.port, clientId=self.client_id)
+            log.debug(f"[EXEC] Connected on port {self.port} clientId={self.client_id}")
 
-    # ── EWrapper callbacks ────────────────────────────────────────────────────
+    def disconnect(self) -> None:
+        if self.ib.isConnected():
+            self.ib.disconnect()
+            log.debug("[EXEC] Disconnected.")
 
-    def nextValidId(self, order_id: int) -> None:
-        self.next_order_id = order_id
-        self._ready.set()
-        log.info(f"Next valid order id: {order_id}")
+    # ──────────────────────────────────────────────────────────────
+    # Bracket order
+    # ──────────────────────────────────────────────────────────────
 
-    def orderStatus(
-        self,
-        order_id,
-        status,
-        filled,
-        remaining,
-        avg_fill,
-        perm_id,
-        parent_id,
-        last_fill,
-        client_id,
-        why_held,
-        mkt_cap,
-    ) -> None:
-        self._orders[order_id] = status
-        log.info(f"Order {order_id}: {status}  filled={filled}  avgFill={avg_fill}")
-
-    def openOrder(self, order_id, contract, order, order_state) -> None:
-        px = getattr(order, "lmtPrice", None) or getattr(order, "auxPrice", None)
-        log.info(
-            f"OpenOrder {order_id}: {order.action} "
-            f"{order.totalQuantity} {contract.symbol} @ {px}"
-        )
-
-    def execDetails(self, req_id, contract, execution) -> None:
-        log.info(
-            f"Execution: {contract.symbol} {execution.side} "
-            f"{execution.shares} @ {execution.price}"
-        )
-
-    def error(self, *args) -> None:
-        """
-        Flexible error handler — accepts 3, 4, or 5 positional args.
-
-        Classic ibapi:
-            error(req_id, error_code, error_string)
-            error(req_id, error_code, error_string, advanced_order_reject)
-        Protobuf ibapi (v10.19+):
-            error(req_id, error_time, error_code, error_string, advanced_order_reject)
-        """
-        req_id = -1
-        error_code = -1
-        error_string = ""
-
-        if len(args) == 3:
-            req_id, error_code, error_string = args
-        elif len(args) == 4:
-            req_id, error_code, error_string, _ = args
-        elif len(args) >= 5:
-            # protobuf path: second arg is error_time (int milliseconds)
-            req_id, _error_time, error_code, error_string = (
-                args[0],
-                args[1],
-                args[2],
-                args[3],
-            )
-
-        # Suppress known informational messages
-        if error_code in (2104, 2106, 2107, 2108, 2119, 2158, 2174):
-            log.debug(f"IB info  req={req_id}  code={error_code}  {error_string}")
-        else:
-            log.error(f"IBKR error  req={req_id}  code={error_code}  {error_string}")
-
-    # ── Order helpers ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _make_contract(symbol: str, exchange: str, currency: str) -> Contract:
-        c = Contract()
-        c.symbol = symbol
-        c.secType = "STK"
-        c.exchange = exchange
-        c.currency = currency
-        return c
-
-    def place_bracket(
+    def place_bracket_order(
         self,
         symbol: str,
-        direction: str,
-        entry: float,
-        stop: float,
-        target: float,
+        action: str,  # "BUY" or "SELL"
         quantity: int,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
         exchange: str = "SMART",
         currency: str = "USD",
-    ) -> tuple[int, int, int]:
+    ) -> int:
         """
-        Submit a bracket order (entry LMT + stop STP + target LMT).
-        Returns (entry_id, stop_id, target_id).
+        Submit a bracket: LMT entry + STP loss + LMT profit target.
+
+        Returns the parent order ID (int).
+        Raises RuntimeError on placement failure.
         """
-        if self.next_order_id is None:
-            raise RuntimeError("Not connected — call connect_and_run() first.")
+        self.connect()
 
-        contract = self._make_contract(symbol, exchange, currency)
-        entry_id = self.next_order_id
-        stop_id = entry_id + 1
-        target_id = entry_id + 2
-        self.next_order_id += 3
+        contract = Stock(symbol, exchange, currency)
+        self.ib.qualifyContracts(contract)
 
-        side = "BUY" if direction == "LONG" else "SELL"
-        exit_side = "SELL" if direction == "LONG" else "BUY"
+        reverse = "SELL" if action == "BUY" else "BUY"
 
-        entry_order = Order()
-        entry_order.orderId = entry_id
-        entry_order.action = side
-        entry_order.orderType = "LMT"
-        entry_order.lmtPrice = round(entry, 2)
-        entry_order.totalQuantity = quantity
-        entry_order.transmit = False
-        entry_order.tif = "DAY"
+        # ── Parent: limit entry ───────────────────────────────────
+        parent = LimitOrder(action, quantity, round(entry_price, 2))
+        parent.orderId = self.ib.client.getReqId()
+        parent.transmit = False  # hold until children attached
 
-        stop_order = Order()
-        stop_order.orderId = stop_id
-        stop_order.action = exit_side
-        stop_order.orderType = "STP"
-        stop_order.auxPrice = round(stop, 2)
-        stop_order.totalQuantity = quantity
-        stop_order.parentId = entry_id
-        stop_order.transmit = False
-        stop_order.tif = "DAY"
+        # ── Child 1: stop loss ───────────────────────────────────
+        stop = StopOrder(reverse, quantity, round(stop_price, 2))
+        stop.orderId = self.ib.client.getReqId()
+        stop.parentId = parent.orderId
+        stop.transmit = False
 
-        tp_order = Order()
-        tp_order.orderId = target_id
-        tp_order.action = exit_side
-        tp_order.orderType = "LMT"
-        tp_order.lmtPrice = round(target, 2)
-        tp_order.totalQuantity = quantity
-        tp_order.parentId = entry_id
-        tp_order.transmit = True
-        tp_order.tif = "DAY"
+        # ── Child 2: profit target ────────────────────────────────
+        target = LimitOrder(reverse, quantity, round(target_price, 2))
+        target.orderId = self.ib.client.getReqId()
+        target.parentId = parent.orderId
+        target.transmit = True  # transmit=True on last child fires all three
 
-        self.placeOrder(entry_id, contract, entry_order)
-        self.placeOrder(stop_id, contract, stop_order)
-        self.placeOrder(target_id, contract, tp_order)
+        parent_trade = self.ib.placeOrder(contract, parent)
+        stop_trade = self.ib.placeOrder(contract, stop)
+        target_trade = self.ib.placeOrder(contract, target)
 
+        self.ib.sleep(1)  # give TWS a moment to acknowledge
+
+        if parent_trade is None:
+            raise RuntimeError("[EXEC] Parent order was not acknowledged by TWS.")
+
+        self._trades[parent.orderId] = parent_trade
         log.info(
-            f"Bracket submitted: {direction} {quantity}x {symbol}  "
-            f"entry={entry}  stop={stop}  target={target}  "
-            f"ids=({entry_id},{stop_id},{target_id})"
+            f"[EXEC] Bracket placed | parentId={parent.orderId} "
+            f"{action} {quantity}×{symbol} "
+            f"entry={entry_price:.2f}  stop={stop_price:.2f}  target={target_price:.2f}"
         )
-        return entry_id, stop_id, target_id
+        return parent.orderId
 
-    def cancel_order(self, order_id: int) -> None:
-        self.cancelOrder(order_id, "")
-        log.info(f"Cancel requested for order {order_id}")
+    # ──────────────────────────────────────────────────────────────
+    # Order status & fill price
+    # ──────────────────────────────────────────────────────────────
+
+    def get_order_status(self, parent_id: int) -> str:
+        """
+        Return the current status string of the parent order.
+        Possible values: "Submitted", "PreSubmitted", "Filled",
+                         "Cancelled", "Inactive", "Unknown"
+        """
+        self.connect()
+        trades = self.ib.trades()
+        for trade in trades:
+            if trade.order.orderId == parent_id:
+                return trade.orderStatus.status
+        # Also check child orders — if a child (stop or target) filled,
+        # the bracket is done.
+        for trade in trades:
+            if trade.order.parentId == parent_id:
+                if trade.orderStatus.status == "Filled":
+                    return "Filled"
+        return "Unknown"
+
+    def get_fill_price(self, parent_id: int) -> Optional[float]:
+        """
+        Return the average fill price of whichever child order filled
+        (stop or target), or None if neither has filled yet.
+        """
+        self.connect()
+        for trade in self.ib.trades():
+            if (
+                trade.order.parentId == parent_id
+                and trade.orderStatus.status == "Filled"
+                and trade.orderStatus.avgFillPrice
+            ):
+                return float(trade.orderStatus.avgFillPrice)
+        return None
+
+    # ──────────────────────────────────────────────────────────────
+    # Hard close
+    # ──────────────────────────────────────────────────────────────
+
+    def cancel_all_children(self, parent_id: int) -> None:
+        """
+        Cancel all open child orders (stop + target) and close any
+        remaining position with a market order.
+        """
+        self.connect()
+        cancelled = 0
+        filled_action = None
+        qty = 0
+
+        for trade in self.ib.trades():
+            order = trade.order
+            status = trade.orderStatus.status
+
+            # Cancel open children
+            if order.parentId == parent_id and status not in (
+                "Filled",
+                "Cancelled",
+                "Inactive",
+            ):
+                self.ib.cancelOrder(order)
+                cancelled += 1
+                log.info(f"[EXEC] Cancelled child orderId={order.orderId}")
+
+            # Remember entry fill direction so we know how to flatten
+            if order.orderId == parent_id and status == "Filled":
+                filled_action = order.action
+                qty = int(order.filledQuantity)
+
+        self.ib.sleep(1)
+
+        # Flatten residual position with a MKT order
+        if filled_action and qty > 0:
+            close_action = "SELL" if filled_action == "BUY" else "BUY"
+            # Reconstruct contract — pull from any trade with this parent
+            contract = None
+            for trade in self.ib.trades():
+                if (
+                    trade.order.orderId == parent_id
+                    or trade.order.parentId == parent_id
+                ):
+                    contract = trade.contract
+                    break
+
+            if contract:
+                mkt = Order()
+                mkt.action = close_action
+                mkt.orderType = "MKT"
+                mkt.totalQuantity = qty
+                mkt.transmit = True
+                self.ib.placeOrder(contract, mkt)
+                log.info(
+                    f"[EXEC] Market close sent: {close_action} {qty} to flatten position."
+                )
+
+        log.info(f"[EXEC] Hard close complete — {cancelled} child(ren) cancelled.")

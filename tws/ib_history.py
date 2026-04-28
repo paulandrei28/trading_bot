@@ -20,30 +20,33 @@ class IBHistoryConfig:
     bar_size: str = "1 min"
     what_to_show: str = "TRADES"
     chunk_days: int = 1
+    request_timeout: int = 30  # seconds before reqHistoricalData gives up
 
 
 class IBKRHistoryClient:
-    """
-    Historical data client (separate from trading/execution client).
-    Uses ib_insync to fetch historical OHLCV bars from IBKR.
+    """Fetch 1-min OHLCV bars from IBKR via ib_insync.
+
+    Key improvements:
+    - timeout=30 on every reqHistoricalData → never hangs forever
+    - Returns empty DataFrame (never None) on any error or no-data response
     """
 
-    def __init__(self, cfg: IBHistoryConfig = IBHistoryConfig()):
+    def __init__(self, cfg: IBHistoryConfig = IBHistoryConfig()) -> None:
         self.cfg = cfg
         self.ib = IB()
 
     def connect(self) -> None:
         if not self.ib.isConnected():
-            self.ib.connect(
-                self.cfg.host,
-                self.cfg.port,
-                clientId=self.cfg.client_id,
-                timeout=20,
-            )
+            self.ib.connect(self.cfg.host, self.cfg.port, clientId=self.cfg.client_id)
 
     def disconnect(self) -> None:
         if self.ib.isConnected():
             self.ib.disconnect()
+
+    def _empty(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
 
     def fetch_1m_bars(
         self,
@@ -53,10 +56,11 @@ class IBKRHistoryClient:
         exchange: str = "SMART",
         currency: str = "USD",
     ) -> pd.DataFrame:
-        """
-        Fetch 1-minute bars between [start, end] by walking backwards in chunk_days.
-        Returns DataFrame with columns: timestamp (UTC), open, high, low, close, volume.
-        endDateTime is sent as explicit UTC (yyyymmdd-HH:MM:SS) to avoid IBKR warning 2174.
+        """Fetch 1-minute bars between start..end.
+
+        - Walks backwards in chunk_days increments (safest for IBKR pacing).
+        - timeout=self.cfg.request_timeout prevents hanging on throttled requests.
+        - Returns empty DataFrame on weekend / holiday / Error 162 / timeout.
         """
         if start.tzinfo is None:
             start = NY.localize(start)
@@ -69,12 +73,9 @@ class IBKRHistoryClient:
             end = end.astimezone(NY)
 
         if end <= start:
-            return pd.DataFrame(
-                columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
+            return self._empty()
 
         self.connect()
-
         contract = Stock(symbol, exchange, currency)
         self.ib.qualifyContracts(contract)
 
@@ -85,10 +86,7 @@ class IBKRHistoryClient:
             cur_start = max(start, cur_end - timedelta(days=self.cfg.chunk_days))
             dur_days = max((cur_end - cur_start).days, 1)
             duration_str = f"{dur_days} D"
-
-            # Use explicit UTC format to suppress IBKR warning 2174
-            cur_end_utc = cur_end.astimezone(pytz.UTC)
-            end_str = cur_end_utc.strftime("%Y%m%d-%H:%M:%S")
+            end_str = cur_end.strftime("%Y%m%d %H:%M:%S") + " UTC"
 
             bars = self.ib.reqHistoricalData(
                 contract,
@@ -99,36 +97,36 @@ class IBKRHistoryClient:
                 useRTH=self.cfg.use_rth,
                 formatDate=1,
                 keepUpToDate=False,
+                timeout=self.cfg.request_timeout,  # ← prevents hanging forever
             )
 
+            # util.df() returns None on Error 162, pacing, timeout, holiday
             df = util.df(bars)
-            if not df.empty:
-                df = df.rename(columns={"date": "timestamp"})
-                chunks.append(df)
+            if df is None or df.empty:
+                cur_end = cur_start
+                continue
 
+            df = df.rename(columns={"date": "timestamp"})
+            chunks.append(df[["timestamp", "open", "high", "low", "close", "volume"]])
             cur_end = cur_start
 
         if not chunks:
-            return pd.DataFrame(
-                columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
+            return self._empty()
 
         out = pd.concat(chunks, ignore_index=True)
-        out = out.dropna(subset=["timestamp"])
 
         ts = pd.to_datetime(out["timestamp"], errors="coerce")
-
+        out = out.dropna(subset=["timestamp"])
+        ts = pd.to_datetime(out["timestamp"], errors="coerce")
         if getattr(ts.dt, "tz", None) is None:
             ts = ts.dt.tz_localize(NY)
         else:
             ts = ts.dt.tz_convert(NY)
-
         out["timestamp"] = ts.dt.tz_convert(pytz.UTC)
-        out = out[["timestamp", "open", "high", "low", "close", "volume"]]
-        out = (
-            out.drop_duplicates(subset=["timestamp"])
+
+        return (
+            out[["timestamp", "open", "high", "low", "close", "volume"]]
+            .drop_duplicates(subset="timestamp")
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
-
-        return out

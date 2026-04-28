@@ -30,35 +30,36 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ── Global state ──────────────────────────────────────────────────────────────
 trader_state: dict = {
-    "phase":      "IDLE",
-    "running":    False,
-    "or_filter":  "UNKNOWN",
+    "phase": "IDLE",
+    "running": False,
+    "or_filter": "UNKNOWN",
     "atr_filter": "UNKNOWN",
-    "or_width":   None,
-    "atr_value":  None,
-    "trade":      None,
+    "or_width": None,
+    "atr_value": None,
+    "trade": None,
 }
 process: subprocess.Popen | None = None
 state_lock = threading.Lock()
 
 # ── Phase → step mapping ──────────────────────────────────────────────────────
 TAG_TO_PHASE = {
-    "PRE-MARKET":     "PRE-MARKET",
-    "MARKET OPEN":    "WARM-UP",
-    "WARM-UP":        "WARM-UP",
-    "FILTER":         "FILTER",
-    "OPENING RANGE":  "OPENING RANGE",
-    "TRADE WINDOW":   "SCANNING",
-    "SCAN":           "SCANNING",
-    "SIGNAL":         "SIGNAL FOUND",
-    "ORDER":          "ORDER PLACED",
-    "MONITORING":     "IN TRADE",
-    "RESULT":         "TRADE CLOSED",
-    "SESSION END":    "SESSION END",
-    "SESSION SUMMARY":"SESSION END",
-    "WEEKEND":        "WEEKEND",
-    "LATE START":     "SESSION END",
+    "PRE-MARKET": "PRE-MARKET",
+    "MARKET OPEN": "WARM-UP",
+    "WARM-UP": "WARM-UP",
+    "FILTER": "FILTER",
+    "OPENING RANGE": "OPENING RANGE",
+    "TRADE WINDOW": "SCANNING",
+    "SCAN": "SCANNING",
+    "SIGNAL": "SIGNAL FOUND",
+    "ORDER": "ORDER PLACED",
+    "MONITORING": "IN TRADE",
+    "RESULT": "TRADE CLOSED",
+    "SESSION END": "SESSION END",
+    "SESSION SUMMARY": "SESSION END",
+    "WEEKEND": "WEEKEND",
+    "LATE START": "SESSION END",
 }
+
 
 # ── Log parser ────────────────────────────────────────────────────────────────
 def parse_log_line(line: str) -> dict:
@@ -96,7 +97,7 @@ def parse_log_line(line: str) -> dict:
     m = re.search(r"Computed -- high=([\d.]+)\s+low=([\d.]+)\s+width=([\d.]+)", line)
     if m:
         updates["or_high"] = float(m.group(1))
-        updates["or_low"]  = float(m.group(2))
+        updates["or_low"] = float(m.group(2))
         updates["or_width"] = float(m.group(3))
 
     # Signal detected — entry/stop/target
@@ -107,19 +108,19 @@ def parse_log_line(line: str) -> dict:
     )
     if m:
         updates["trade"] = {
-            "direction":  m.group(1),
+            "direction": m.group(1),
             "entry_time": m.group(2),
-            "entry":      float(m.group(3)),
-            "stop":       float(m.group(4)),
-            "target":     float(m.group(5)),
-            "status":     "SIGNAL",
-            "outcome":    None,
-            "result_r":   None,
-            "pnl_usd":    None,
-            "qty":        None,
-            "max_loss":   None,
-            "target_gain":None,
-            "start_ts":   None,
+            "entry": float(m.group(3)),
+            "stop": float(m.group(4)),
+            "target": float(m.group(5)),
+            "status": "SIGNAL",
+            "outcome": None,
+            "result_r": None,
+            "pnl_usd": None,
+            "qty": None,
+            "max_loss": None,
+            "target_gain": None,
+            "start_ts": None,
         }
 
     # Risk / qty line
@@ -131,9 +132,9 @@ def parse_log_line(line: str) -> dict:
     if m:
         updates["trade_partial"] = {
             "risk_per_share": float(m.group(1)),
-            "qty":            int(m.group(2)),
-            "max_loss":       float(m.group(3)),
-            "target_gain":    float(m.group(4)),
+            "qty": int(m.group(2)),
+            "max_loss": float(m.group(3)),
+            "target_gain": float(m.group(4)),
         }
 
     # Order placed → trade active
@@ -149,18 +150,18 @@ def parse_log_line(line: str) -> dict:
     m = re.search(r"\[RESULT\] TARGET HIT -- \+([\d.]+)R\s+\+\$([\d.]+)", line)
     if m:
         updates["trade_result"] = {
-            "outcome":  "WIN",
+            "outcome": "WIN",
             "result_r": float(m.group(1)),
-            "pnl_usd":  float(m.group(2)),
+            "pnl_usd": float(m.group(2)),
         }
 
     # Stop hit → LOSS
     m = re.search(r"\[RESULT\] STOP HIT -- (-?[\d.]+)R\s+\$(-?[\d.]+)", line)
     if m:
         updates["trade_result"] = {
-            "outcome":  "LOSS",
+            "outcome": "LOSS",
             "result_r": float(m.group(1)),
-            "pnl_usd":  float(m.group(2)),
+            "pnl_usd": float(m.group(2)),
         }
 
     return updates
@@ -170,25 +171,32 @@ def parse_log_line(line: str) -> dict:
 def run_trader_thread(config: dict) -> None:
     global process, trader_state
 
-    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     trader_path = os.path.join(script_dir, "live_trader.py")
 
-    cmd = [sys.executable, trader_path,
-           "--symbol", config["symbol"],
-           "--risk",   str(config["risk"])]
+    cmd = [
+        sys.executable,
+        trader_path,
+        "--symbol",
+        config["symbol"],
+        "--risk",
+        str(config["risk"]),
+    ]
     if config.get("live"):
         cmd.append("--live")
 
     with state_lock:
-        trader_state.update({
-            "phase":      "STARTING",
-            "running":    True,
-            "or_filter":  "UNKNOWN",
-            "atr_filter": "UNKNOWN",
-            "or_width":   None,
-            "atr_value":  None,
-            "trade":      None,
-        })
+        trader_state.update(
+            {
+                "phase": "STARTING",
+                "running": True,
+                "or_filter": "UNKNOWN",
+                "atr_filter": "UNKNOWN",
+                "or_width": None,
+                "atr_value": None,
+                "trade": None,
+            }
+        )
     socketio.emit("state_update", dict(trader_state))
 
     try:
@@ -216,8 +224,14 @@ def run_trader_thread(config: dict) -> None:
                 with state_lock:
                     if "phase" in updates:
                         trader_state["phase"] = updates["phase"]
-                    for key in ("or_filter", "atr_filter", "or_width", "atr_value",
-                                "or_high", "or_low"):
+                    for key in (
+                        "or_filter",
+                        "atr_filter",
+                        "or_width",
+                        "atr_value",
+                        "or_high",
+                        "or_low",
+                    ):
                         if key in updates:
                             trader_state[key] = updates[key]
                     if "trade" in updates:
@@ -243,8 +257,12 @@ def run_trader_thread(config: dict) -> None:
     finally:
         with state_lock:
             trader_state["running"] = False
-            if trader_state["phase"] not in ("TRADE CLOSED", "SESSION END",
-                                              "WEEKEND", "STOPPED"):
+            if trader_state["phase"] not in (
+                "TRADE CLOSED",
+                "SESSION END",
+                "WEEKEND",
+                "STOPPED",
+            ):
                 trader_state["phase"] = "STOPPED"
         socketio.emit("state_update", dict(trader_state))
         socketio.emit("trader_stopped", {})
@@ -253,7 +271,9 @@ def run_trader_thread(config: dict) -> None:
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    html_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "dashboard.html"
+    )
     with open(html_path, encoding="utf-8") as f:
         return f.read()
 
@@ -288,4 +308,6 @@ if __name__ == "__main__":
     print("  FVG Live Trader  --  Dashboard")
     print("  Open http://localhost:5000 in your browser")
     print("=" * 60)
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True
+    )
