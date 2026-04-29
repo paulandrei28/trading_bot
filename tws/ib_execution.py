@@ -1,26 +1,30 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional
 
-from ib_insync import IB, Stock, Order, Trade, LimitOrder, StopOrder, util
-
-import logging
+from ib_insync import IB, Stock, LimitOrder, StopOrder, Order, Trade, util
 
 log = logging.getLogger("live_trader")
 
 
 class IBKRExecutionClient:
     """
-    Handles live/paper bracket order placement and monitoring via ib_insync.
+    Bracket order placement AND monitoring using a SINGLE persistent connection.
 
-    Usage:
+    Critical design rule: placing and monitoring MUST use the same clientId /
+    the same IB instance.  If you disconnect after placing and reconnect with
+    a different clientId, self.ib.trades() returns an empty list and monitoring
+    loops forever returning "Unknown".
+
+    Usage pattern:
         client = IBKRExecutionClient(port=7497, client_id=20)
         client.connect()
-        parent_id = client.place_bracket_order(
-            symbol="QQQ", action="BUY", quantity=10,
-            entry_price=480.50, stop_price=479.66, target_price=482.90
+        parent_id = client.place_bracket_order(...)
+        outcome, result_r = client.monitor_until_done(
+            parent_id, direction, entry, stop_px, target, risk, hard_close_dt
         )
-        status = client.get_order_status(parent_id)
         client.disconnect()
     """
 
@@ -28,30 +32,29 @@ class IBKRExecutionClient:
         self.port = port
         self.client_id = client_id
         self.ib = IB()
-        self._trades: dict[int, Trade] = {}  # parent_id → Trade
 
-    # ──────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # Connection
-    # ──────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def connect(self) -> None:
         if not self.ib.isConnected():
             self.ib.connect("127.0.0.1", self.port, clientId=self.client_id)
-            log.debug(f"[EXEC] Connected on port {self.port} clientId={self.client_id}")
+            log.debug(f"[EXEC] Connected port={self.port} clientId={self.client_id}")
 
     def disconnect(self) -> None:
         if self.ib.isConnected():
             self.ib.disconnect()
             log.debug("[EXEC] Disconnected.")
 
-    # ──────────────────────────────────────────────────────────────
-    # Bracket order
-    # ──────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Place bracket
+    # ─────────────────────────────────────────────────────────────────────────
 
     def place_bracket_order(
         self,
         symbol: str,
-        action: str,  # "BUY" or "SELL"
+        action: str,
         quantity: int,
         entry_price: float,
         stop_price: float,
@@ -60,109 +63,150 @@ class IBKRExecutionClient:
         currency: str = "USD",
     ) -> int:
         """
-        Submit a bracket: LMT entry + STP loss + LMT profit target.
-
-        Returns the parent order ID (int).
-        Raises RuntimeError on placement failure.
+        Submit LMT entry + STP stop + LMT target as a linked bracket.
+        Returns parent orderId. Raises RuntimeError on failure.
+        All three orders stay on THIS connection so monitoring can see them.
         """
-        self.connect()
+        self.connect()  # no-op if already connected
 
         contract = Stock(symbol, exchange, currency)
         self.ib.qualifyContracts(contract)
 
         reverse = "SELL" if action == "BUY" else "BUY"
 
-        # ── Parent: limit entry ───────────────────────────────────
         parent = LimitOrder(action, quantity, round(entry_price, 2))
         parent.orderId = self.ib.client.getReqId()
-        parent.transmit = False  # hold until children attached
+        parent.transmit = False
 
-        # ── Child 1: stop loss ───────────────────────────────────
         stop = StopOrder(reverse, quantity, round(stop_price, 2))
         stop.orderId = self.ib.client.getReqId()
         stop.parentId = parent.orderId
         stop.transmit = False
 
-        # ── Child 2: profit target ────────────────────────────────
         target = LimitOrder(reverse, quantity, round(target_price, 2))
         target.orderId = self.ib.client.getReqId()
         target.parentId = parent.orderId
-        target.transmit = True  # transmit=True on last child fires all three
+        target.transmit = True  # fires all three
 
-        parent_trade = self.ib.placeOrder(contract, parent)
-        stop_trade = self.ib.placeOrder(contract, stop)
-        target_trade = self.ib.placeOrder(contract, target)
+        self.ib.placeOrder(contract, parent)
+        self.ib.placeOrder(contract, stop)
+        self.ib.placeOrder(contract, target)
 
-        self.ib.sleep(1)  # give TWS a moment to acknowledge
+        self.ib.sleep(1)  # allow TWS acknowledgement
 
-        if parent_trade is None:
-            raise RuntimeError("[EXEC] Parent order was not acknowledged by TWS.")
-
-        self._trades[parent.orderId] = parent_trade
         log.info(
             f"[EXEC] Bracket placed | parentId={parent.orderId} "
-            f"{action} {quantity}×{symbol} "
+            f"{action} {quantity}x{symbol} "
             f"entry={entry_price:.2f}  stop={stop_price:.2f}  target={target_price:.2f}"
         )
         return parent.orderId
 
-    # ──────────────────────────────────────────────────────────────
-    # Order status & fill price
-    # ──────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Monitor until done  (replaces separate get_order_status / get_fill_price)
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def get_order_status(self, parent_id: int) -> str:
+    def monitor_until_done(
+        self,
+        parent_id: int,
+        direction: str,
+        entry: float,
+        stop_px: float,
+        target: float,
+        risk: float,
+        hard_close_dt,  # datetime (NY tz-aware)
+        poll_interval: int = 10,
+    ) -> tuple[str, float]:
         """
-        Return the current status string of the parent order.
-        Possible values: "Submitted", "PreSubmitted", "Filled",
-                         "Cancelled", "Inactive", "Unknown"
+        Poll every poll_interval seconds on the SAME connection used to place.
+        Checks child order fills (stop or target) for the final result.
+        Returns (outcome, result_r).
         """
-        self.connect()
-        trades = self.ib.trades()
-        for trade in trades:
-            if trade.order.orderId == parent_id:
-                return trade.orderStatus.status
-        # Also check child orders — if a child (stop or target) filled,
-        # the bracket is done.
-        for trade in trades:
-            if trade.order.parentId == parent_id:
-                if trade.orderStatus.status == "Filled":
-                    return "Filled"
-        return "Unknown"
+        from datetime import datetime
+        import pytz
 
-    def get_fill_price(self, parent_id: int) -> Optional[float]:
-        """
-        Return the average fill price of whichever child order filled
-        (stop or target), or None if neither has filled yet.
-        """
-        self.connect()
+        NY = pytz.timezone("America/New_York")
+
+        log.info(
+            f"[MONITORING] Watching parentId={parent_id} | "
+            f"stop={stop_px:.2f}  target={target:.2f}"
+        )
+
+        while True:
+            now = datetime.now(NY)
+
+            # ── Hard close at 16:00 ──────────────────────────────────────────
+            if now >= hard_close_dt:
+                log.info("[MONITORING] Hard close 16:00 — cancelling open bracket.")
+                self._cancel_bracket(parent_id)
+                return "BE", 0.0
+
+            # ── Check all trades visible on this connection ──────────────────
+            self.ib.sleep(0)  # process pending events without blocking
+
+            filled_child = self._find_filled_child(parent_id)
+
+            if filled_child is not None:
+                fill_price = filled_child.orderStatus.avgFillPrice
+                if fill_price and risk > 0:
+                    result_r = round(
+                        (
+                            (fill_price - entry) / risk
+                            if direction == "LONG"
+                            else (entry - fill_price) / risk
+                        ),
+                        2,
+                    )
+                else:
+                    result_r = 0.0
+
+                outcome = (
+                    "WIN" if result_r >= 2.5 else ("LOSS" if result_r <= -0.9 else "BE")
+                )
+                log.info(
+                    f"[RESULT] {outcome}  result_r={result_r:+.2f}R  "
+                    f"fill={fill_price:.2f}  (orderId={filled_child.order.orderId})"
+                )
+                return outcome, result_r
+
+            # ── Check if parent was cancelled externally ─────────────────────
+            parent_status = self._get_trade_status(parent_id)
+            if parent_status in ("Cancelled", "Inactive"):
+                log.warning(
+                    f"[MONITORING] Parent order {parent_id} was cancelled externally."
+                )
+                return "BE", 0.0
+
+            time.sleep(poll_interval)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _find_filled_child(self, parent_id: int) -> Optional[Trade]:
+        """Return the first child trade that has Filled status, or None."""
         for trade in self.ib.trades():
             if (
                 trade.order.parentId == parent_id
                 and trade.orderStatus.status == "Filled"
-                and trade.orderStatus.avgFillPrice
             ):
-                return float(trade.orderStatus.avgFillPrice)
+                return trade
         return None
 
-    # ──────────────────────────────────────────────────────────────
-    # Hard close
-    # ──────────────────────────────────────────────────────────────
+    def _get_trade_status(self, order_id: int) -> str:
+        for trade in self.ib.trades():
+            if trade.order.orderId == order_id:
+                return trade.orderStatus.status
+        return "Unknown"
 
-    def cancel_all_children(self, parent_id: int) -> None:
-        """
-        Cancel all open child orders (stop + target) and close any
-        remaining position with a market order.
-        """
-        self.connect()
+    def _cancel_bracket(self, parent_id: int) -> None:
+        """Cancel all open children and market-close the position if filled."""
         cancelled = 0
-        filled_action = None
-        qty = 0
+        filled_parent: Optional[Trade] = None
 
         for trade in self.ib.trades():
             order = trade.order
             status = trade.orderStatus.status
 
-            # Cancel open children
             if order.parentId == parent_id and status not in (
                 "Filled",
                 "Cancelled",
@@ -172,35 +216,23 @@ class IBKRExecutionClient:
                 cancelled += 1
                 log.info(f"[EXEC] Cancelled child orderId={order.orderId}")
 
-            # Remember entry fill direction so we know how to flatten
             if order.orderId == parent_id and status == "Filled":
-                filled_action = order.action
-                qty = int(order.filledQuantity)
+                filled_parent = trade
 
         self.ib.sleep(1)
 
-        # Flatten residual position with a MKT order
-        if filled_action and qty > 0:
-            close_action = "SELL" if filled_action == "BUY" else "BUY"
-            # Reconstruct contract — pull from any trade with this parent
-            contract = None
-            for trade in self.ib.trades():
-                if (
-                    trade.order.orderId == parent_id
-                    or trade.order.parentId == parent_id
-                ):
-                    contract = trade.contract
-                    break
-
-            if contract:
+        if filled_parent:
+            close_action = "SELL" if filled_parent.order.action == "BUY" else "BUY"
+            qty = int(filled_parent.orderStatus.filled)
+            if qty > 0:
                 mkt = Order()
                 mkt.action = close_action
                 mkt.orderType = "MKT"
                 mkt.totalQuantity = qty
                 mkt.transmit = True
-                self.ib.placeOrder(contract, mkt)
+                self.ib.placeOrder(filled_parent.contract, mkt)
                 log.info(
-                    f"[EXEC] Market close sent: {close_action} {qty} to flatten position."
+                    f"[EXEC] Market close: {close_action} {qty} to flatten position."
                 )
 
-        log.info(f"[EXEC] Hard close complete — {cancelled} child(ren) cancelled.")
+        log.info(f"[EXEC] Hard close done — {cancelled} child order(s) cancelled.")

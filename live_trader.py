@@ -11,576 +11,629 @@ Usage:
     python live_trader.py --symbol SPY --risk 200
 """
 
-from __future__ import annotations
-
-import argparse
+import csv
+import datetime
 import logging
-import math
 import os
-import sys
 import time
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pytz
+from ib_insync import IB, Order, Stock
 
+from backtest.analysis import add_daily_volatility_features
 from strategy.fvg_strategy import FVGConfig, generate_trades
-from tws.ib_history import IBKRHistoryClient, IBHistoryConfig
+from tws.ib_history import IBHistoryConfig, IBKRHistoryClient
 
-NY = pytz.timezone("America/New_York")
+NY = ZoneInfo("America/New_York")
+log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-def setup_logging(symbol: str, paper: bool) -> logging.Logger:
-    mode = "paper" if paper else "live"
-    today = datetime.now(NY).strftime("%Y-%m-%d")
-    os.makedirs("logs", exist_ok=True)
-    log_file = f"logs/live_{symbol}_{today}_{mode}.log"
-    fmt = "%(asctime)s %(levelname)s %(message)s"
+def _setup_logging(log_path: str) -> None:
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    fmt = "%(asctime)s %(levelname)-5s %(message)s"
+    datefmt = "%Y-%m-%d %H%M%S"
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
+        datefmt=datefmt,
         handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(),
         ],
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    log = logging.getLogger("live_trader")
-    log.info(f"[LOGGING] Log file: {log_file}")
-    return log
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Bar fetching  (uses 30-second timeout to prevent hangs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def fetch_bars(
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    port: int,
-    client_id: int = 21,
-) -> pd.DataFrame:
-    """Fetch 1-min bars from IBKR with a 30-second per-request timeout."""
-    cfg = IBHistoryConfig(port=port, client_id=client_id, request_timeout=30)
-    client = IBKRHistoryClient(cfg)
-    try:
-        df = client.fetch_1m_bars(symbol, start, end)
-        return df if df is not None else pd.DataFrame()
-    except Exception as exc:
-        logging.getLogger("live_trader").warning(f"[DATA] fetch_bars error: {exc}")
-        return pd.DataFrame()
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Daily OR / ATR helpers  (called once at startup, not in the scan loop)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _daily_table(bars: pd.DataFrame) -> pd.DataFrame:
-    """Return per-day DataFrame with or_width and atr14 columns."""
-    import datetime as _dt
-
-    df = bars.copy()
-    df["ts_ny"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(NY)
-    df["date"] = df["ts_ny"].dt.date
-    df["t"] = df["ts_ny"].dt.time
-
-    or_mask = (df["t"] >= _dt.time(9, 30)) & (df["t"] < _dt.time(9, 35))
-    daily_or = (
-        df[or_mask]
-        .groupby("date")
-        .agg(or_high=("high", "max"), or_low=("low", "min"))
-        .assign(or_width=lambda x: x["or_high"] - x["or_low"])
-        .reset_index()
     )
 
-    daily_p = (
-        df.groupby("date")
-        .agg(high=("high", "max"), low=("low", "min"), close=("close", "last"))
-        .reset_index()
-    )
-    daily_p["prev_close"] = daily_p["close"].shift(1)
-    daily_p["tr"] = daily_p.apply(
-        lambda r: max(
-            r["high"] - r["low"],
-            abs(r["high"] - r["prev_close"]) if pd.notna(r["prev_close"]) else 0.0,
-            abs(r["low"] - r["prev_close"]) if pd.notna(r["prev_close"]) else 0.0,
-        ),
-        axis=1,
-    )
-    daily_p["atr14"] = daily_p["tr"].rolling(14, min_periods=1).mean()
-    return daily_or.merge(daily_p[["date", "atr14"]], on="date", how="left")
-
-
-def compute_filters(
-    warmup_df: pd.DataFrame,
-    log: logging.Logger,
-) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
-    """Compute OR skip band (Q2) and ATR threshold (median) once at startup."""
-    if warmup_df is None or warmup_df.empty:
-        log.warning("[FILTER] Empty warm-up — filters disabled.")
-        return None, None, None, 0
-
-    daily = _daily_table(warmup_df)
-    n_days = len(daily)
-
-    if n_days < 5:
-        log.warning(f"[FILTER] Only {n_days} days in warm-up — filters disabled.")
-        return None, None, None, n_days
-
-    q20 = float(daily["or_width"].quantile(0.20))
-    q40 = float(daily["or_width"].quantile(0.40))
-    atr_threshold = float(daily["atr14"].median())
-
-    or_skip = int(((daily["or_width"] > q20) & (daily["or_width"] <= q40)).sum())
-    atr_skip = int((daily["atr14"] < atr_threshold).sum())
-
-    log.info(f"[FILTER] OR skip band       : ({q20:.3f}, {q40:.3f}]")
-    log.info(f"[FILTER] ATR min threshold  : {atr_threshold:.3f}")
-    log.info(f"[FILTER] OR would skip      : {or_skip}/{n_days} historical days")
-    log.info(f"[FILTER] ATR would skip     : {atr_skip}/{n_days} historical days")
-    return q20, q40, atr_threshold, n_days
-
-
-def get_today_atr(warmup_df: pd.DataFrame, today) -> Optional[float]:
-    if warmup_df is None or warmup_df.empty:
-        return None
-    daily = _daily_table(warmup_df)
-    row = daily[daily["date"] == today]
-    return float(row.iloc[-1]["atr14"]) if not row.empty else None
-
-
-def should_skip_day(
-    or_width: float,
-    atr_today: Optional[float],
-    q20: Optional[float],
-    q40: Optional[float],
-    atr_threshold: Optional[float],
-    log: logging.Logger,
-) -> bool:
-    skip_or = (q20 is not None) and (q20 < or_width <= q40)
-    skip_atr = (atr_threshold is not None and atr_today is not None) and (
-        atr_today < atr_threshold
-    )
-    atr_str = f"{atr_today:.3f}" if atr_today is not None else "N/A"
-
-    if skip_or:
-        log.info(f"[FILTER] SKIP — OR {or_width:.3f} in Q2 band ({q20:.3f}, {q40:.3f}]")
-        return True
-    if skip_atr:
-        log.info(f"[FILTER] SKIP — ATR {atr_str} < threshold {atr_threshold:.3f}")
-        return True
-
-    log.info(f"[FILTER] PASS — OR={or_width:.3f}  ATR={atr_str}")
-    return False
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Order placement + trade monitoring
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-def place_bracket_order(
-    symbol: str,
-    direction: str,
-    entry: float,
-    stop_px: float,
-    target: float,
-    qty: int,
-    port: int,
-    log: logging.Logger,
-) -> Optional[int]:
-    try:
-        from tws.ib_execution import IBKRExecutionClient
+class FVGLiveTrader:
+    def __init__(
+        self,
+        symbol: str,
+        cfg: FVGConfig,
+        risk_per_trade: float = 100.0,
+        paper: bool = True,
+        host: str = "127.0.0.1",
+    ) -> None:
+        self.symbol = symbol
+        self.cfg = cfg
+        self.risk_per_trade = risk_per_trade
+        self.paper = paper
+        self.host = host
+        self.port = 7497 if paper else 7496
+        self._mode = "PAPER" if paper else "LIVE"  # BUG-3 fix
 
-        client = IBKRExecutionClient(port=port, client_id=20)
-        client.connect()
-        action = "BUY" if direction == "LONG" else "SELL"
-        log.info(
-            f"[ORDER] Placing bracket: {action} {qty}×{symbol} | "
-            f"entry={entry:.2f}  stop={stop_px:.2f}  target={target:.2f}"
-        )
-        parent_id = client.place_bracket_order(
-            symbol=symbol,
-            action=action,
-            quantity=qty,
-            entry_price=entry,
-            stop_price=stop_px,
-            target_price=target,
-        )
-        log.info(f"[ORDER] Bracket submitted — parentId={parent_id}")
+        self.trade_open: bool = False
+        self.trade_taken: bool = False
+
+        self.entry_order_id: int | None = None
+        self.stop_order_id: int | None = None
+        self.target_order_id: int | None = None
+
+        self.direction: str | None = None
+        self.entry_price: float | None = None
+        self.stop_price: float | None = None
+        self.target_price: float | None = None
+        self.risk: float | None = None
+        self.qty: int | None = None
+
+        self.result_r: float | None = None
+        self.outcome: str | None = None
+        self.entry_time: datetime.datetime | None = None
+        self.exit_time: datetime.datetime | None = None
+        self.exit_price: float | None = None
+
+        # ── Filter thresholds ──────────────────────────────────────────────
+        self.or_skip_lo: float | None = None
+        self.or_skip_hi: float | None = None
+        self.atr_min: float | None = None
+        self.today_or: float | None = None
+        self.today_atr: float | None = None
+        self.filter_pass: bool = False
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _now_ny(self) -> datetime.datetime:
+        return datetime.datetime.now(tz=NY)
+
+    def _today(self) -> datetime.date:
+        return self._now_ny().date()
+
+    def _connect(self, client_id: int) -> IB:
+        ib = IB()
+        ib.connect(self.host, self.port, clientId=client_id)
+        log.info(f"Connecting to {self.host}:{self.port} with clientId {client_id}...")
+        log.info("Connected")
+        return ib
+
+    def _journal_path(self) -> Path:
+        return Path("logs") / f"journal_{self.symbol}.csv"
+
+    # ── Warm-up ───────────────────────────────────────────────────────────
+
+    def _warmup(self) -> None:
+        log.info("WARM-UP Fetching 30 days of 1m bars for OR/ATR filters...")
+        hist_cfg = IBHistoryConfig(host=self.host, port=self.port, client_id=21)
+        client = IBKRHistoryClient(hist_cfg)
+        end = self._now_ny()
+        start = end - datetime.timedelta(days=30)
+        bars = client.fetch_1m_bars(self.symbol, start, end)
         client.disconnect()
-        return parent_id
-    except ImportError:
-        log.error("[ORDER] tws/ib_execution.py not found — cannot place orders.")
-        return None
-    except Exception as exc:
-        log.error(f"[ORDER] Placement failed: {exc}")
-        return None
 
+        if bars.empty:
+            log.warning("WARM-UP No bars loaded — filters disabled")
+            return
 
-def monitor_open_trade(
-    parent_id: int,
-    direction: str,
-    entry: float,
-    stop_px: float,
-    target: float,
-    risk: float,
-    hard_close_dt: datetime,
-    port: int,
-    log: logging.Logger,
-) -> Tuple[str, float]:
-    try:
-        from tws.ib_execution import IBKRExecutionClient
+        log.info(
+            f"WARM-UP {len(bars)} bars loaded "
+            f"{bars['timestamp'].min().date()} to {bars['timestamp'].max().date()}"
+        )
+        log.info("FILTER Computing daily OR and ATR filters from warm-up data...")
 
-        client = IBKRExecutionClient(port=port, client_id=25)
-        client.connect()
-    except Exception as exc:
-        log.error(f"[MONITORING] Cannot connect execution client: {exc}")
-        return "BE", 0.0
+        daily = add_daily_volatility_features(bars)
+        daily = daily.dropna(subset=["opening_range_5m", "atr_14"])
+        if daily.empty:
+            log.warning("FILTER Not enough data to compute filters — disabled")
+            return
 
-    log.info(
-        f"[MONITORING] Watching parentId={parent_id} | stop={stop_px:.2f}  target={target:.2f}"
-    )
+        or_vals = daily["opening_range_5m"].dropna()
+        self.or_skip_lo = float(or_vals.quantile(0.20))
+        self.or_skip_hi = float(or_vals.quantile(0.40))
+        self.atr_min = float(daily["atr_14"].median())
 
-    try:
-        while True:
-            if datetime.now(NY) >= hard_close_dt:
-                log.info("[MONITORING] Hard close 16:00 — cancelling open bracket.")
-                try:
-                    client.cancel_all_children(parent_id)
-                except Exception as exc:
-                    log.warning(f"[MONITORING] Cancel error: {exc}")
-                return "BE", 0.0
+        log.info(f"FILTER OR skip band {self.or_skip_lo:.3f}, {self.or_skip_hi:.3f}")
+        log.info(f"FILTER ATR min threshold {self.atr_min:.3f}")
 
-            try:
-                status = client.get_order_status(parent_id)
-                fill_price = client.get_fill_price(parent_id)
-            except Exception as exc:
-                log.warning(f"[MONITORING] Status check error: {exc}")
-                time.sleep(10)
-                continue
+        or_skip_n = int(
+            ((or_vals >= self.or_skip_lo) & (or_vals <= self.or_skip_hi)).sum()
+        )
+        atr_skip_n = int((daily["atr_14"] < self.atr_min).sum())
+        log.info(f"FILTER OR would skip {or_skip_n} historical days")
+        log.info(f"FILTER ATR would skip {atr_skip_n} historical days")
 
-            if status in ("Filled", "Cancelled", "Inactive"):
-                result_r = 0.0
-                if fill_price is not None and risk > 0:
-                    result_r = round(
-                        (
-                            (fill_price - entry) / risk
-                            if direction == "LONG"
-                            else (entry - fill_price) / risk
-                        ),
-                        2,
-                    )
-                outcome = (
-                    "WIN" if result_r >= 2.5 else ("LOSS" if result_r <= -0.9 else "BE")
-                )
-                log.info(
-                    f"[RESULT] {outcome}  result_r={result_r:+.2f}R  "
-                    f"fill={fill_price}  status={status}"
-                )
-                return outcome, result_r
+    # ── Today filters ─────────────────────────────────────────────────────
 
-            time.sleep(10)
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+    def _fetch_today_filters(self) -> None:
+        log.info("OPENING RANGE Window closed. Fetching today's OR and ATR...")
+        hist_cfg = IBHistoryConfig(host=self.host, port=self.port, client_id=22)
+        client = IBKRHistoryClient(hist_cfg)
+        today_start = datetime.datetime.combine(
+            self._today(), datetime.time(9, 30), tzinfo=NY
+        )
+        bars = client.fetch_1m_bars(self.symbol, today_start, self._now_ny())
+        client.disconnect()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Session summary
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _session_summary(
-    log: logging.Logger,
-    args: argparse.Namespace,
-    trade_placed: bool,
-    outcome: str = "N/A",
-    result_r: float = 0.0,
-) -> None:
-    log.info("=" * 65)
-    log.info("[SESSION SUMMARY]")
-    log.info(f"  Symbol : {args.symbol}")
-    log.info(f"  Mode   : {'PAPER' if args.paper else 'LIVE'}")
-    log.info(f"  Risk   : ${args.risk:.2f} / trade")
-    log.info(f"  Trade  : {'YES — ' + outcome if trade_placed else 'NO TRADE'}")
-    if trade_placed:
-        log.info(f"  Result : {result_r:+.2f}R  (${result_r * args.risk:+.2f})")
-    log.info("=" * 65)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Scanning loop  --  KEY FIX: incremental bar fetching, no repeated full pulls
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def run_scanning_loop(
-    args: argparse.Namespace,
-    cfg: FVGConfig,
-    market_open_dt: datetime,
-    trade_start_dt: datetime,
-    cutoff_dt: datetime,
-    hard_close_dt: datetime,
-    log: logging.Logger,
-) -> Tuple[bool, str, float]:
-    """
-    Incremental bar fetching strategy to avoid IBKR pacing violations:
-      - First iteration: fetch all bars from market open → now  (one big request)
-      - Subsequent iterations: fetch only last 3 minutes of new bars, append
-      - Result: 1 large request at start + 1 tiny request every 30s
-        instead of 1 large request every 15s (which hits pacing at ~7.5 min)
-    """
-    today = datetime.now(NY).date()
-    today_str = str(today)
-
-    log.info("[SCANNING] Starting incremental scan loop (10:00 → 15:00 NY)...")
-    log.info("[SCANNING] First fetch: full day bars from market open...")
-
-    # ── Initial full-day fetch ────────────────────────────────────────────────
-    scan_end = datetime.now(NY).replace(second=0, microsecond=0)
-    all_bars = fetch_bars(
-        args.symbol, market_open_dt, scan_end, args.port, client_id=24
-    )
-
-    if all_bars.empty:
-        log.warning("[SCANNING] Initial bar fetch returned empty — cannot scan.")
-        return False, "N/A", 0.0
-
-    log.info(f"[SCANNING] Loaded {len(all_bars)} bars for today. Entering scan loop...")
-
-    known_signal_time = None
-
-    while datetime.now(NY) < cutoff_dt:
-        now = datetime.now(NY)
-
-        if now < trade_start_dt:
-            time.sleep(30)
-            continue
-
-        # ── Incremental fetch: only the last 3 minutes ────────────────────────
-        # This is just 1 tiny request every 30s instead of a full-day request.
-        # IBKR counts this as 1 pacing unit regardless of size.
-        new_end = now.replace(second=0, microsecond=0)
-        new_start = new_end - timedelta(minutes=3)
-
-        new_bars = fetch_bars(args.symbol, new_start, new_end, args.port, client_id=24)
-
-        if new_bars is not None and not new_bars.empty:
-            # Append only truly new bars (deduplicate on timestamp)
-            combined = pd.concat([all_bars, new_bars], ignore_index=True)
-            all_bars = (
-                combined.drop_duplicates(subset="timestamp")
-                .sort_values("timestamp")
-                .reset_index(drop=True)
+        if bars.empty:
+            log.warning(
+                "FILTER Today OR=NA ATR=NA (no bars fetched) — ATR filter inactive"
             )
+            self.filter_pass = True
+            return
 
-        # ── Run FVG strategy on full day bars ─────────────────────────────────
-        trades = generate_trades(all_bars, cfg)
-        today_trades = [t for t in trades if str(t.get("date", "")) == today_str]
+        daily = add_daily_volatility_features(bars)
+        today_row = daily[daily["date"] == self._today()]
 
-        if not today_trades:
-            time.sleep(30)
-            continue
+        if today_row.empty:
+            log.warning("FILTER Today OR=NA ATR=NA — ATR filter inactive")
+            self.filter_pass = True
+            return
 
-        signal = today_trades[-1]
-        sig_time = signal.get("entry_time")
+        r = today_row.iloc[0]
+        self.today_or = (
+            float(r["opening_range_5m"]) if pd.notna(r["opening_range_5m"]) else None
+        )
+        self.today_atr = float(r["atr_14"]) if pd.notna(r["atr_14"]) else None
 
-        if sig_time == known_signal_time:
-            time.sleep(30)
-            continue
+        or_str = f"{self.today_or:.3f}" if self.today_or is not None else "NA"
+        atr_str = f"{self.today_atr:.3f}" if self.today_atr is not None else "NA"
+        log.info(f"FILTER Today OR={or_str} ATR={atr_str}")
 
-        known_signal_time = sig_time
-        direction = signal["direction"]
-        entry = signal["entry"]
-        stop_px = signal["stop"]
-        target = signal["target"]
-        risk = abs(entry - stop_px)
+        if self.today_atr is None:
+            log.warning("FILTER ATR=NA — ATR filter inactive today")
+
+        or_pass = True
+        atr_pass = True
+
+        if self.or_skip_lo is not None and self.today_or is not None:
+            if self.or_skip_lo <= self.today_or <= self.or_skip_hi:
+                or_pass = False
+                log.info(
+                    f"FILTER SKIP OR={or_str} in skip band "
+                    f"[{self.or_skip_lo:.3f}, {self.or_skip_hi:.3f}]"
+                )
+
+        if self.atr_min is not None and self.today_atr is not None:
+            if self.today_atr < self.atr_min:
+                atr_pass = False
+                log.info(
+                    f"FILTER SKIP ATR={atr_str} below threshold {self.atr_min:.3f}"
+                )
+
+        self.filter_pass = or_pass and atr_pass
+        if self.filter_pass:
+            log.info(f"FILTER PASS OR={or_str} ATR={atr_str}")
+        else:
+            log.info("FILTER SKIP day — no trades today")
+
+    # ── Bracket placement ─────────────────────────────────────────────────
+
+    def _place_bracket(
+        self,
+        ib: IB,
+        direction: str,
+        entry: float,
+        stop: float,
+        target: float,
+        qty: int,
+    ) -> tuple[int, int, int]:
+        contract = Stock(self.symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+
+        action = "BUY" if direction == "LONG" else "SELL"
+        close_action = "SELL" if direction == "LONG" else "BUY"
+
+        parent_id = ib.client.getReqId()
+
+        entry_o = Order()
+        entry_o.orderId = parent_id
+        entry_o.action = action
+        entry_o.orderType = "LMT"
+        entry_o.lmtPrice = round(entry, 2)
+        entry_o.totalQuantity = qty
+        entry_o.transmit = False
+        entry_o.tif = "DAY"
+
+        stop_o = Order()
+        stop_o.orderId = parent_id + 1
+        stop_o.action = close_action
+        stop_o.orderType = "STP"
+        stop_o.auxPrice = round(stop, 2)
+        stop_o.totalQuantity = qty
+        stop_o.parentId = parent_id
+        stop_o.transmit = False
+        stop_o.tif = "DAY"
+
+        target_o = Order()
+        target_o.orderId = parent_id + 2
+        target_o.action = close_action
+        target_o.orderType = "LMT"
+        target_o.lmtPrice = round(target, 2)
+        target_o.totalQuantity = qty
+        target_o.parentId = parent_id
+        target_o.transmit = True
+        target_o.tif = "DAY"
+
+        ib.placeOrder(contract, entry_o)
+        ib.placeOrder(contract, stop_o)
+        ib.placeOrder(contract, target_o)
+        ib.sleep(1)
+
+        log.info(
+            f"BRACKET PLACED {direction} {qty}x {self.symbol} "
+            f"entry={entry:.2f} stop={stop:.2f} target={target:.2f} "
+            f"orderIds={parent_id}/{parent_id+1}/{parent_id+2}"
+        )
+        return parent_id, parent_id + 1, parent_id + 2
+
+    # ── Reconcile ─────────────────────────────────────────────────────────
+
+    def _reconcile(self, ib: IB) -> None:
+        """
+        Check executions to update trade_taken and trade_open flags.
+
+        BUG-1 fix: trade_taken is set HERE (when entry fill is confirmed in
+        executions), not when the signal fires.  trade_open is cleared when
+        the stop or target fill is confirmed.
+        """
+        if self.entry_order_id is None:
+            return
+
+        for ex in ib.executions():
+            oid = ex.execution.orderId
+            price = ex.execution.price
+
+            # Entry fill confirmed
+            if oid == self.entry_order_id and not self.trade_taken:
+                self.trade_taken = True
+                log.info(
+                    f"ENTRY FILLED orderId={oid} "
+                    f"{self.direction} {self.qty}x @ {price:.2f} [trade_taken=True]"
+                )
+
+            # Exit fill (stop or target)
+            if oid in (self.stop_order_id, self.target_order_id) and self.trade_open:
+                self.trade_open = False
+                self.exit_price = price
+                self.exit_time = self._now_ny()
+
+                if oid == self.stop_order_id:
+                    self.result_r = -1.0
+                    self.outcome = "LOSS"
+                else:
+                    self.result_r = float(self.cfg.rr)
+                    self.outcome = "WIN"
+
+                log.info(
+                    f"RESULT {self.outcome} result_r={self.result_r:.2f}R "
+                    f"fill={self.exit_price:.2f} orderId={oid}"
+                )
+
+    # ── Hard close ────────────────────────────────────────────────────────
+
+    def _hard_close(self, ib: IB) -> None:
+        if not self.trade_open:
+            return
+        log.info("HARD CLOSE Cancelling bracket and flattening position...")
+
+        for oid in (self.entry_order_id, self.stop_order_id, self.target_order_id):
+            if oid is not None:
+                try:
+                    ib.cancelOrder(Order(orderId=oid))
+                except Exception:
+                    pass
+
+        contract = Stock(self.symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+        close_action = "SELL" if self.direction == "LONG" else "BUY"
+        mkt = Order()
+        mkt.action = close_action
+        mkt.orderType = "MKT"
+        mkt.totalQuantity = self.qty
+        mkt.tif = "DAY"
+        ib.placeOrder(contract, mkt)
+        ib.sleep(2)
+
+        self.trade_open = False
+        if self.result_r is None:
+            self.result_r = 0.0
+            self.outcome = "BE"
+        log.info(f"HARD CLOSE Position flattened -> {self.outcome}")
+
+    # ── Journal ───────────────────────────────────────────────────────────
+
+    def _write_journal(self) -> None:
+        """
+        BUG-2 fix: called unconditionally at SESSION END.
+        Previously this was only called inside the real-time fill callback,
+        so trades that closed during a poll-cycle disconnect were never logged.
+        """
+        if not self.trade_taken:
+            log.info("JOURNAL No trade today — skipping")
+            return
+
+        path = self._journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not path.exists()
+
+        row = {
+            "date": self._today().isoformat(),
+            "symbol": self.symbol,
+            "mode": self._mode,
+            "direction": self.direction or "",
+            "entry_time": self.entry_time.isoformat() if self.entry_time else "",
+            "exit_time": self.exit_time.isoformat() if self.exit_time else "",
+            "entry_price": self.entry_price or "",
+            "stop_price": self.stop_price or "",
+            "target_price": self.target_price or "",
+            "exit_price": self.exit_price or "",
+            "risk": self.risk or "",
+            "qty": self.qty or "",
+            "risk_usd": (
+                round(self.risk * self.qty, 2) if (self.risk and self.qty) else ""
+            ),
+            "result_r": self.result_r if self.result_r is not None else "",
+            "outcome": self.outcome or "",
+            "today_or": self.today_or or "",
+            "today_atr": self.today_atr or "",
+        }
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        log.info(f"JOURNAL Written -> {path}")
+
+    # ── Scan tick ─────────────────────────────────────────────────────────
+
+    def _scan_tick(self, ib: IB, bars: pd.DataFrame) -> None:
+        """
+        Called every ~30 s while in the scan window.
+
+        BUG-1 fix: the very first check is `if self.trade_taken: reconcile only`.
+        Once an entry fills, trade_taken=True for the rest of the session and
+        no new signal is ever evaluated, regardless of whether trade_open is
+        still True or has already become False.
+        """
+        if self.trade_taken:
+            self._reconcile(ib)
+            return
+
+        if not self.filter_pass:
+            return
+
+        trade_start_t = datetime.time(*map(int, self.cfg.trade_start.split(":")))
+        trade_end_t = datetime.time(*map(int, self.cfg.trade_end.split(":")))
+        now_t = self._now_ny().time()
+
+        if now_t < trade_start_t or now_t > trade_end_t:
+            return
+
+        signal_trades = generate_trades(bars, self.cfg)
+        if not signal_trades:
+            return
+
+        sig = signal_trades[-1]  # generate_trades returns at most 1 per day
+        direction = sig["direction"]
+        entry = sig["entry"]
+        stop = sig["stop"]
+        target = sig["target"]
+        risk = sig.get("risk", abs(entry - stop))
 
         if risk <= 0:
-            log.warning(f"[SIGNAL] Zero-risk signal skipped at {sig_time}")
-            time.sleep(30)
-            continue
+            return
 
-        qty = max(1, math.floor(args.risk / risk))
-        usd_risk = round(qty * risk, 2)
+        qty = max(1, int(self.risk_per_trade / risk))
         log.info(
-            f"[SIGNAL] {direction} @ {entry:.2f} | stop={stop_px:.2f}  target={target:.2f} | "
-            f"qty={qty}  risk=${usd_risk}  target=${round(usd_risk * args.rr, 2)}"
+            f"SIGNAL {direction} entry={entry:.2f} stop={stop:.2f} "
+            f"target={target:.2f} risk={risk:.4f} qty={qty}"
         )
 
-        parent_id = place_bracket_order(
-            args.symbol, direction, entry, stop_px, target, qty, args.port, log
+        entry_id, stop_id, target_id = self._place_bracket(
+            ib, direction, entry, stop, target, qty
         )
+        self.trade_open = True
+        self.entry_order_id = entry_id
+        self.stop_order_id = stop_id
+        self.target_order_id = target_id
+        self.direction = direction
+        self.entry_price = entry
+        self.stop_price = stop
+        self.target_price = target
+        self.risk = risk
+        self.qty = qty
+        self.entry_time = self._now_ny()
 
-        if parent_id is None:
-            log.error("[SIGNAL] Order placement failed — will not retry same signal.")
+    # ── Main run loop ─────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        today = self._today()
+        mode_label = "PAPER MODE" if self.paper else "LIVE MODE"
+        log_path = (
+            f"logs/live_{self.symbol}_{today}_{'paper' if self.paper else 'live'}.log"
+        )
+        _setup_logging(log_path)
+
+        log.info(f"LOGGING Log file {log_path}")
+        log.info("")
+        log.info(f"FVG Live Trader -- {mode_label}")  # BUG-3 fix: mode from self._mode
+        log.info(f"Symbol {self.symbol}")
+        log.info(f"Port {self.port} (paper=7497 live=7496)")
+        log.info(f"Risk/trade {self.risk_per_trade}")
+        log.info(f"Session {self.cfg.session_start} - {self.cfg.trade_end} NY entries")
+        log.info("Monitoring until 16:00 NY open trade hard close")
+        log.info(f"Trade win {self.cfg.trade_start} - {self.cfg.trade_end} NY")
+        log.info(f"Script started at {self._now_ny().strftime('%H%M')} NY")
+        log.info("")
+
+        # ── Pre-market wait ────────────────────────────────────────────────
+        market_open_t = datetime.time(9, 30)
+        while self._now_ny().time() < market_open_t:
+            rem = (
+                datetime.datetime.combine(today, market_open_t, tzinfo=NY)
+                - self._now_ny()
+            )
+            s = int(rem.total_seconds())
+            log.info(
+                f"PRE-MARKET Waiting for market open 0930 NY. "
+                f"{s // 60}m {s % 60:02d}s remaining..."
+            )
             time.sleep(30)
-            continue
 
-        outcome, result_r = monitor_open_trade(
-            parent_id,
-            direction,
-            entry,
-            stop_px,
-            target,
-            risk,
-            hard_close_dt,
-            args.port,
-            log,
+        # ── Warm-up ───────────────────────────────────────────────────────
+        log.info("MARKET OPEN Market is open. Starting warm-up.")
+        self._warmup()
+
+        # ── Wait for opening range ─────────────────────────────────────────
+        opening_end_t = datetime.time(9, 35)
+        while self._now_ny().time() < opening_end_t:
+            rem = (
+                datetime.datetime.combine(today, opening_end_t, tzinfo=NY)
+                - self._now_ny()
+            )
+            s = int(rem.total_seconds())
+            log.info(
+                f"OPENING RANGE Waiting for 0935 NY. "
+                f"{s // 60}m {s % 60:02d}s remaining..."
+            )
+            time.sleep(15)
+
+        # ── Fetch today filters ────────────────────────────────────────────
+        self._fetch_today_filters()
+
+        if not self.filter_pass:
+            log.info("SESSION END Filter skip — no trades today")
+            self._write_journal()  # BUG-2 fix
+            return
+
+        # ── Scan / monitor loop ────────────────────────────────────────────
+        scan_end_t = datetime.time(15, 0)
+        hard_close_t = datetime.time(16, 0)
+        cid = 24
+
+        log.info(
+            f"SCANNING Starting incremental scan loop "
+            f"{self.cfg.trade_start} {self.cfg.trade_end} NY..."
         )
-        return True, outcome, result_r
+        log.info("SCANNING First fetch full day bars from market open...")
 
-    log.info("[SCANNING] Session ended — no trade taken today.")
-    return False, "N/A", 0.0
+        while self._now_ny().time() < hard_close_t:
+            ib = None
+            try:
+                ib = self._connect(cid)
+                cid += 1
+                now = self._now_ny()
+
+                # Fetch today's bars via a second connection to avoid clientId clash
+                today_start = datetime.datetime.combine(
+                    today, datetime.time(9, 30), tzinfo=NY
+                )
+                hist_cfg = IBHistoryConfig(
+                    host=self.host, port=self.port, client_id=cid
+                )
+                cid += 1
+                hist = IBKRHistoryClient(hist_cfg)
+                bars = hist.fetch_1m_bars(self.symbol, today_start, now)
+                hist.disconnect()
+
+                if not bars.empty:
+                    log.info(f"SCANNING Loaded {len(bars)} bars for today.")
+
+                    # Always reconcile first if a bracket is open
+                    if self.trade_open or self.entry_order_id:
+                        self._reconcile(ib)
+
+                    # Hard-close if past 16:00
+                    if now.time() >= hard_close_t and self.trade_open:
+                        self._hard_close(ib)
+                        break
+
+                    # Scan only inside window and only if no trade taken today
+                    if not self.trade_taken and now.time() < scan_end_t:
+                        self._scan_tick(ib, bars)
+
+            except Exception as exc:
+                log.error(f"SCAN ERROR {exc}")
+            finally:
+                if ib and ib.isConnected():
+                    ib.disconnect()
+                    log.info("Disconnecting")
+
+            time.sleep(30)
+
+        # ── Session end ────────────────────────────────────────────────────
+        log.info("SESSION END Hard close time reached")
+        try:
+            ib = self._connect(cid)
+            if self.trade_open:
+                self._hard_close(ib)
+            elif self.entry_order_id:
+                self._reconcile(ib)
+            ib.disconnect()
+        except Exception as exc:
+            log.error(f"SESSION END final reconcile error: {exc}")
+
+        self._write_journal()
+
+        or_str = f"{self.today_or:.3f}" if self.today_or is not None else "NA"
+        atr_str = f"{self.today_atr:.3f}" if self.today_atr is not None else "NA"
+        log.info("===== SESSION SUMMARY =====")
+        log.info(f"  Mode       {self._mode}")
+        log.info(f"  Symbol     {self.symbol}")
+        log.info(f"  Trade      {'YES' if self.trade_taken else 'NO'}")
+        if self.trade_taken:
+            log.info(f"  Direction  {self.direction}")
+            log.info(f"  Entry      {self.entry_price:.2f}")
+            ep = f"{self.exit_price:.2f}" if self.exit_price is not None else "N/A"
+            log.info(f"  Exit       {ep}")
+            rr = f"{self.result_r:.2f}R" if self.result_r is not None else "N/A"
+            log.info(f"  Result     {rr}  [{self.outcome}]")
+        log.info(f"  Filter OR  {or_str}")
+        log.info(f"  Filter ATR {atr_str}")
+        log.info("===========================")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
+if __name__ == "__main__":
+    from strategy.fvg_strategy import FVGConfig
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="FVG Live Trader")
-    parser.add_argument("--symbol", default="QQQ")
-    parser.add_argument("--port", type=int, default=7497)
-    parser.add_argument("--risk", type=float, default=100.0)
-    parser.add_argument("--rr", type=float, default=3.0)
-    parser.add_argument("--paper", action="store_true")
-    parser.add_argument("--warmup-days", type=int, default=30)
-    args = parser.parse_args()
-
-    paper = args.paper or (args.port == 7497)
-    log = setup_logging(args.symbol, paper)
-    now_ny = datetime.now(NY)
-    today = now_ny.date()
-
-    log.info("=" * 65)
-    log.info(f"FVG Live Trader -- {'PAPER' if paper else 'LIVE'} MODE")
-    log.info(f"  Symbol    : {args.symbol}")
-    log.info(f"  Port      : {args.port} (paper={7497} / live={7496})")
-    log.info(f"  Risk/trade: ${args.risk}")
-    log.info(f"  Session   : 09:30 - 15:00 NY (entries)")
-    log.info(f"  Monitoring: until 16:00 NY (open trade hard close)")
-    log.info(f"  Trade win : 10:00 - 15:00 NY")
-    log.info(f"  Script started at: {now_ny.strftime('%H:%M')} NY")
-    log.info("=" * 65)
-
-    # ── Weekend guard ──────────────────────────────────────────────────────────
-    if now_ny.weekday() >= 5:
-        log.info(
-            f"[WEEKEND] Today is {now_ny.strftime('%A')}. Markets closed. Exiting."
-        )
-        _session_summary(log, args, trade_placed=False)
-        return
-
-    market_open_dt = NY.localize(datetime(today.year, today.month, today.day, 9, 30))
-    or_end_dt = NY.localize(datetime(today.year, today.month, today.day, 9, 35))
-    trade_start_dt = NY.localize(datetime(today.year, today.month, today.day, 10, 0))
-    cutoff_dt = NY.localize(datetime(today.year, today.month, today.day, 15, 0))
-    hard_close_dt = NY.localize(datetime(today.year, today.month, today.day, 16, 0))
-
-    # ── Pre-market wait ────────────────────────────────────────────────────────
-    while datetime.now(NY) < market_open_dt:
-        remaining = (market_open_dt - datetime.now(NY)).total_seconds()
-        mins = int(remaining // 60)
-        secs = int(remaining % 60)
-        log.info(
-            f"[PRE-MARKET] Waiting for market open (09:30 NY). {mins}m {secs:02d}s remaining..."
-        )
-        time.sleep(30)
-
-    log.info("[MARKET OPEN] Market is open. Starting warm-up.")
-
-    # ── Warm-up (one request, done once) ──────────────────────────────────────
-    warmup_start = market_open_dt - timedelta(days=args.warmup_days)
-    log.info(
-        f"[WARM-UP] Fetching {args.warmup_days} days of 1m bars for OR/ATR filters..."
-    )
-    warmup_df = fetch_bars(
-        args.symbol, warmup_start, market_open_dt, args.port, client_id=21
-    )
-
-    if not warmup_df.empty:
-        d_min = pd.to_datetime(warmup_df["timestamp"]).min().date()
-        d_max = pd.to_datetime(warmup_df["timestamp"]).max().date()
-        log.info(f"[WARM-UP] {len(warmup_df)} bars loaded ({d_min} to {d_max})")
-    else:
-        log.warning("[WARM-UP] No warm-up data — proceeding without filters.")
-
-    # ── Filters (computed ONCE here, never again in the scan loop) ────────────
-    log.info("[FILTER] Computing daily OR and ATR filters from warm-up data...")
-    q20, q40, atr_threshold, _ = compute_filters(warmup_df, log)
-
-    # ── Wait for opening range to close ───────────────────────────────────────
-    while datetime.now(NY) < or_end_dt:
-        remaining = (or_end_dt - datetime.now(NY)).total_seconds()
-        mins = int(remaining // 60)
-        secs = int(remaining % 60)
-        log.info(
-            f"[OPENING RANGE] Waiting for 09:35 NY. {mins}m {secs:02d}s remaining..."
-        )
-        time.sleep(min(15, max(remaining, 1)))
-
-    log.info("[OPENING RANGE] Window closed. Fetching today's OR and ATR...")
-
-    # ── Today's OR ─────────────────────────────────────────────────────────────
-    today_bars = fetch_bars(
-        args.symbol, market_open_dt, or_end_dt, args.port, client_id=22
-    )
-
-    if today_bars is None or today_bars.empty:
-        log.warning("[FILTER] No intraday bars today (holiday?). Exiting.")
-        _session_summary(log, args, trade_placed=False)
-        return
-
-    or_width_today = float(today_bars["high"].max()) - float(today_bars["low"].min())
-    atr_today = get_today_atr(warmup_df, today)
-    log.info(
-        f"[FILTER] Today OR={or_width_today:.3f}  ATR={'%.3f' % atr_today if atr_today else 'N/A'}"
-    )
-
-    if should_skip_day(or_width_today, atr_today, q20, q40, atr_threshold, log):
-        log.info("[SESSION END] Day filtered. No trades today.")
-        _session_summary(log, args, trade_placed=False)
-        return
-
-    # ── Strategy config ────────────────────────────────────────────────────────
     cfg = FVGConfig(
         tick_size=0.01,
-        rr=args.rr,
+        rr=3.0,
         session_start="09:30",
         opening_end="09:35",
         trade_start="10:00",
-        cutoff_time="15:00",
+        trade_end="15:00",
         one_trade_per_day=True,
         retest_mode="close",
+        use_profit_lock=True,
+        lock1_trigger_r=1.5,
+        lock1_stop_r=0.5,
+        lock2_trigger_r=2.5,
+        lock2_stop_r=1.0,
     )
 
-    # ── Scan + trade ───────────────────────────────────────────────────────────
-    trade_placed, outcome, result_r = run_scanning_loop(
-        args, cfg, market_open_dt, trade_start_dt, cutoff_dt, hard_close_dt, log
+    trader = FVGLiveTrader(
+        symbol="QQQ",
+        cfg=cfg,
+        risk_per_trade=100.0,
+        paper=True,
     )
-
-    _session_summary(
-        log, args, trade_placed=trade_placed, outcome=outcome, result_r=result_r
-    )
-
-
-if __name__ == "__main__":
-    main()
+    trader.run()

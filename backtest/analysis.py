@@ -1,6 +1,6 @@
-import warnings
 import pandas as pd
 import numpy as np
+import warnings
 
 
 def _ensure_datetime(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -9,7 +9,8 @@ def _ensure_datetime(trades_df: pd.DataFrame) -> pd.DataFrame:
     dropped = df["entry_time"].isna().sum()
     if dropped > 0:
         warnings.warn(
-            f"[analysis] _ensure_datetime: dropped {dropped} rows with invalid entry_time"
+            f"_ensure_datetime: dropped {dropped} rows with invalid entry_time",
+            stacklevel=2,
         )
     return df.dropna(subset=["entry_time"])
 
@@ -19,9 +20,8 @@ def profit_by_time_buckets(
 ) -> pd.DataFrame:
     """
     Groups performance by time bucket of entry_time.
-    bucket_minutes=60 -> hourly, bucket_minutes=30 -> half-hour.
-    Returns a table with trades, win_rate, avg_r, total_r.
-    win_rate_% is computed as wins / (wins + losses), excluding BE trades.
+    bucket_minutes=60  -> hourly
+    bucket_minutes=30  -> half-hour buckets
     """
     df = _ensure_datetime(trades_df)
     if df.empty:
@@ -30,10 +30,10 @@ def profit_by_time_buckets(
     minutes = (df["entry_time"].dt.hour * 60) + df["entry_time"].dt.minute
     bucket = (minutes // bucket_minutes) * bucket_minutes
 
+    df = df.copy()
     df["bucket_label"] = bucket.apply(lambda m: f"{m // 60:02d}:{m % 60:02d}")
-    # FIX: removed redundant bucket_start_min column
 
-    g = df.groupby("bucket_label", sort=True)
+    g = df.groupby("bucket_label")
 
     out = g.agg(
         trades=("result_r", "count"),
@@ -44,35 +44,31 @@ def profit_by_time_buckets(
         total_r=("result_r", "sum"),
     ).reset_index()
 
-    # FIX: win rate excludes BE trades (wins / (wins + losses)), which is standard in trading analysis
-    decisive = out["wins"] + out["losses"]
-    out["win_rate_%"] = np.where(decisive > 0, out["wins"] / decisive * 100, 0.0)
+    contested = out["wins"] + out["losses"]
+    out["win_rate_%"] = np.where(
+        contested > 0,
+        out["wins"] / contested * 100,
+        0.0,
+    )
 
-    return out.reset_index(drop=True)
+    return out.sort_values("bucket_label").reset_index(drop=True)
 
 
 def add_daily_volatility_features(bars_df: pd.DataFrame) -> pd.DataFrame:
     """
     From 1m bars, compute per-day volatility features:
-    - opening_range_5m (09:30-09:35 high-low)
-    - atr_14 (Wilder's ATR using EWM, period=14)
-    - day_range (daily high-low)
-    Returns daily_df indexed by date with these columns.
+      - opening_range_5m  (09:30–09:35 high-low)
+      - atr_14            (rolling 14-day ATR, simple MA — note: not Wilder EMA)
+      - day_range         (daily high-low)
+    Returns daily DataFrame indexed by date.
     """
     df = bars_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
-
-    # FIX: guard against naive timestamps
-    if df["timestamp"].dt.tz is None:
-        warnings.warn(
-            "[analysis] add_daily_volatility_features: timestamps appear tz-naive, localising as UTC"
-        )
-        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
-
     df["timestamp_ny"] = df["timestamp"].dt.tz_convert("America/New_York")
     df["date"] = df["timestamp_ny"].dt.date
 
+    # Daily OHLC from 1m bars
     daily = df.groupby("date").agg(
         open=("open", "first"),
         high=("high", "max"),
@@ -83,6 +79,7 @@ def add_daily_volatility_features(bars_df: pd.DataFrame) -> pd.DataFrame:
 
     daily["day_range"] = daily["high"] - daily["low"]
 
+    # True Range + ATR(14) simple rolling mean
     prev_close = daily["close"].shift(1)
     tr = pd.concat(
         [
@@ -94,11 +91,9 @@ def add_daily_volatility_features(bars_df: pd.DataFrame) -> pd.DataFrame:
     ).max(axis=1)
 
     daily["tr"] = tr
+    daily["atr_14"] = daily["tr"].rolling(14).mean()
 
-    # FIX: use Wilder's EMA (span = 2*period - 1) instead of simple rolling mean
-    daily["atr_14"] = daily["tr"].ewm(span=27, min_periods=14, adjust=False).mean()
-
-    # Opening range 09:30-09:35 (first 5 minutes)
+    # Opening range 09:30–09:35
     opening = (
         df[
             (df["timestamp_ny"].dt.time >= pd.to_datetime("09:30").time())
@@ -111,10 +106,8 @@ def add_daily_volatility_features(bars_df: pd.DataFrame) -> pd.DataFrame:
         )
     )
     opening["opening_range_5m"] = opening["or_high"] - opening["or_low"]
-    opening = opening[["opening_range_5m"]]
-    # FIX: removed dead "time_ny" column
 
-    daily = daily.join(opening, how="left")
+    daily = daily.join(opening[["opening_range_5m"]], how="left")
     return daily.reset_index()
 
 
@@ -122,17 +115,15 @@ def attach_volatility_to_trades(
     trades_df: pd.DataFrame, daily_vol_df: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Adds columns to trades_df: opening_range_5m, atr_14, day_range
-    by matching on date.
+    Adds opening_range_5m, atr_14, day_range columns to trades_df by date.
     """
-    # FIX: validate required column exists
     if "date" not in trades_df.columns:
         raise ValueError("trades_df must contain a 'date' column")
 
     t = trades_df.copy()
-    dv = daily_vol_df.copy()
-
     t["date"] = pd.to_datetime(t["date"]).dt.date
+
+    dv = daily_vol_df.copy()
     dv["date"] = pd.to_datetime(dv["date"]).dt.date
 
     return t.merge(
@@ -146,9 +137,8 @@ def profit_by_volatility_bins(
     trades_df: pd.DataFrame, col: str, bins: int = 5
 ) -> pd.DataFrame:
     """
-    Bin trades by a volatility feature (e.g. opening_range_5m, atr_14)
+    Bin trades by a volatility feature (opening_range_5m, atr_14, …)
     and compute performance per bin.
-    win_rate_% excludes BE trades.
     """
     df = trades_df.copy()
     df = df.dropna(subset=[col])
@@ -165,10 +155,15 @@ def profit_by_volatility_bins(
         be=("result_r", lambda x: (x == 0).sum()),
         avg_r=("result_r", "mean"),
         total_r=("result_r", "sum"),
+        vol_min=(col, "min"),
+        vol_max=(col, "max"),
     ).reset_index(drop=True)
 
-    # FIX: guard against division by zero; exclude BE from win rate
-    decisive = out["wins"] + out["losses"]
-    out["win_rate_%"] = np.where(decisive > 0, out["wins"] / decisive * 100, 0.0)
+    contested = out["wins"] + out["losses"]
+    out["win_rate_%"] = np.where(
+        contested > 0,
+        out["wins"] / contested * 100,
+        0.0,
+    )
 
     return out
