@@ -144,7 +144,7 @@ def generate_trades(
         return []
 
     if skip_filters:
-        day_filter = {}  # all days pass — filters handled externally
+        day_filter = {}  # all days pass -- filters handled externally
     else:
         day_filter = _build_daily_filters(df, cfg)
 

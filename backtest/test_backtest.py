@@ -17,9 +17,9 @@ from backtest.analysis import (
     profit_by_volatility_bins,
 )
 
-# ────────────────────────────────────────────────
-# Strategy config — filtered version
-# ────────────────────────────────────────────────
+# ------------------------------------------------
+# Strategy config -- filtered version
+# ------------------------------------------------
 symbol = "QQQ"
 
 cfg = FVGConfig(
@@ -32,7 +32,7 @@ cfg = FVGConfig(
     # Filter 1: time window
     trade_start="10:00",
     cutoff_time="15:00",
-    # Filter 2: skip Q2 OR band (20th–40th pct = indecision days)
+    # Filter 2: skip Q2 OR band (20th-40th pct = indecision days)
     use_or_filter=True,
     or_skip_pct_low=0.20,
     or_skip_pct_high=0.40,
@@ -41,9 +41,9 @@ cfg = FVGConfig(
     atr_min_pct=0.50,
 )
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Data file selection
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 DATA_FILE = ""
 
 
@@ -67,9 +67,9 @@ parts = Path(data_path).stem.split("_")
 start_str = parts[2] if len(parts) >= 5 else "start"
 end_str = parts[3] if len(parts) >= 5 else "end"
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Output paths
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 os.makedirs("logs", exist_ok=True)
 
 TRADES_OUT = f"logs/trades_{symbol}_{start_str}_{end_str}.csv"
@@ -81,9 +81,9 @@ TRADES_VOL_OUT = f"logs/trades_with_volatility_{symbol}_{start_str}_{end_str}.cs
 OR_BINS_OUT = f"logs/perf_by_opening_range_bins_{symbol}_{start_str}_{end_str}.csv"
 ATR_BINS_OUT = f"logs/perf_by_atr_bins_{symbol}_{start_str}_{end_str}.csv"
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Load & validate data
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 df = pd.read_csv(data_path)
 
 required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
@@ -93,21 +93,21 @@ if missing:
 
 print(f"[INFO] Rows loaded: {len(df)}")
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Backtest
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 trades = backtest(df, cfg)
 trades_df = pd.DataFrame(trades)
 trades_df.to_csv(TRADES_OUT, index=False)
 print(f"[OK] Saved trades -> {TRADES_OUT}  ({len(trades)} trades)")
 
 if trades_df.empty:
-    print("\nNo trades — check data range and config.")
+    print("\nNo trades -- check data range and config.")
     sys.exit(0)
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Performance report
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 report = performance_report(trades_df)
 
 print("\n===== BACKTEST REPORT =====")
@@ -118,9 +118,9 @@ for key, value in report.items():
 report["equity_curve"].to_csv(EQUITY_OUT, index=False)
 print(f"[OK] Equity curve -> {EQUITY_OUT}")
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Time & volatility analysis
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 hourly = profit_by_time_buckets(trades_df, bucket_minutes=60)
 half_hour = profit_by_time_buckets(trades_df, bucket_minutes=30)
 hourly.to_csv(PROFIT_HOUR_OUT, index=False)
@@ -138,9 +138,9 @@ atr_bins.to_csv(ATR_BINS_OUT, index=False)
 
 print(f"[OK] All analysis CSVs saved to logs/")
 
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 # Console summary
-# ────────────────────────────────────────────────
+# ------------------------------------------------
 wins_n = (trades_df["result_r"] > 0).sum()
 losses_n = (trades_df["result_r"] < 0).sum()
 bes_n = (trades_df["result_r"] == 0).sum()

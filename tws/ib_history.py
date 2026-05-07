@@ -27,7 +27,7 @@ class IBKRHistoryClient:
     """Fetch 1-min OHLCV bars from IBKR via ib_insync.
 
     Key improvements:
-    - timeout=30 on every reqHistoricalData → never hangs forever
+    - timeout=30 on every reqHistoricalData -> never hangs forever
     - Returns empty DataFrame (never None) on any error or no-data response
     """
 
@@ -97,7 +97,7 @@ class IBKRHistoryClient:
                 useRTH=self.cfg.use_rth,
                 formatDate=1,
                 keepUpToDate=False,
-                timeout=self.cfg.request_timeout,  # ← prevents hanging forever
+                timeout=self.cfg.request_timeout,  # <-- prevents hanging forever
             )
 
             # util.df() returns None on Error 162, pacing, timeout, holiday

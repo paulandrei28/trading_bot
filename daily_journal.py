@@ -168,7 +168,7 @@ def append_or_update(entry: JournalEntry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Convenience builders — call these from live_trader.py
+# Convenience builders -- call these from live_trader.py
 # ---------------------------------------------------------------------------
 
 
@@ -277,7 +277,7 @@ def record_trade_result(
     Call this once the trade closes (stop or target hit, or session end).
     """
     if not JOURNAL_PATH.exists():
-        log.warning("[JOURNAL] Cannot update result — journal file not found.")
+        log.warning("[JOURNAL] Cannot update result -- journal file not found.")
         return
 
     date_str = _today_str()

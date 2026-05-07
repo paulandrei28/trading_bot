@@ -1,7 +1,7 @@
 """
 live_trader.py
 --------------
-FVG Live Trader — integrates with IBKR TWS via ibapi + ib_insync.
+FVG Live Trader -- integrates with IBKR TWS via ibapi + ib_insync.
 Supports paper and live trading, late-start detection, OR/ATR filters,
 detailed phase logging, and daily journal CSV.
 
@@ -32,9 +32,9 @@ from daily_journal import record_skip, record_trade_open, record_trade_result
 NY = pytz.timezone("America/New_York")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Logging
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def setup_logging(symbol: str, paper: bool) -> logging.Logger:
@@ -57,9 +57,9 @@ def setup_logging(symbol: str, paper: bool) -> logging.Logger:
     return log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Bar fetching  (uses 30-second timeout to prevent hangs)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def fetch_bars(
@@ -85,9 +85,9 @@ def fetch_bars(
             pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Daily OR / ATR helpers  (called once at startup, not in the scan loop)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def _daily_table(bars: pd.DataFrame) -> pd.DataFrame:
@@ -132,14 +132,14 @@ def compute_filters(
 ) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
     """Compute OR skip band (Q2) and ATR threshold (median) once at startup."""
     if warmup_df is None or warmup_df.empty:
-        log.warning("[FILTER] Empty warm-up — filters disabled.")
+        log.warning("[FILTER] Empty warm-up -- filters disabled.")
         return None, None, None, 0
 
     daily = _daily_table(warmup_df)
     n_days = len(daily)
 
     if n_days < 5:
-        log.warning(f"[FILTER] Only {n_days} days in warm-up — filters disabled.")
+        log.warning(f"[FILTER] Only {n_days} days in warm-up -- filters disabled.")
         return None, None, None, n_days
 
     q20 = float(daily["or_width"].quantile(0.20))
@@ -179,19 +179,19 @@ def should_skip_day(
     atr_str = f"{atr_today:.3f}" if atr_today is not None else "N/A"
 
     if skip_or:
-        log.info(f"[FILTER] SKIP — OR {or_width:.3f} in Q2 band ({q20:.3f}, {q40:.3f}]")
+        log.info(f"[FILTER] SKIP -- OR {or_width:.3f} in Q2 band ({q20:.3f}, {q40:.3f}]")
         return True
     if skip_atr:
-        log.info(f"[FILTER] SKIP — ATR {atr_str} < threshold {atr_threshold:.3f}")
+        log.info(f"[FILTER] SKIP -- ATR {atr_str} < threshold {atr_threshold:.3f}")
         return True
 
-    log.info(f"[FILTER] PASS — OR={or_width:.3f}  ATR={atr_str}")
+    log.info(f"[FILTER] PASS -- OR={or_width:.3f}  ATR={atr_str}")
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Order placement + trade monitoring
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def place_bracket_order(
@@ -211,7 +211,7 @@ def place_bracket_order(
         client.connect()
         action = "BUY" if direction == "LONG" else "SELL"
         log.info(
-            f"[ORDER] Placing bracket: {action} {qty}×{symbol} | "
+            f"[ORDER] Placing bracket: {action} {qty}x{symbol} | "
             f"entry={entry:.2f}  stop={stop_px:.2f}  target={target:.2f}"
         )
         parent_id = client.place_bracket_order(
@@ -222,11 +222,11 @@ def place_bracket_order(
             stop_price=stop_px,
             target_price=target,
         )
-        log.info(f"[ORDER] Bracket submitted — parentId={parent_id}")
+        log.info(f"[ORDER] Bracket submitted -- parentId={parent_id}")
         client.disconnect()
         return parent_id
     except ImportError:
-        log.error("[ORDER] tws/ib_execution.py not found — cannot place orders.")
+        log.error("[ORDER] tws/ib_execution.py not found -- cannot place orders.")
         return None
     except Exception as exc:
         log.error(f"[ORDER] Placement failed: {exc}")
@@ -260,7 +260,7 @@ def monitor_open_trade(
     try:
         while True:
             if datetime.now(NY) >= hard_close_dt:
-                log.info("[MONITORING] Hard close 16:00 — cancelling open bracket.")
+                log.info("[MONITORING] Hard close 16:00 -- cancelling open bracket.")
                 try:
                     client.cancel_all_children(parent_id)
                 except Exception as exc:
@@ -303,9 +303,9 @@ def monitor_open_trade(
             pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Session summary
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def _session_summary(
@@ -320,15 +320,15 @@ def _session_summary(
     log.info(f"  Symbol : {args.symbol}")
     log.info(f"  Mode   : {'PAPER' if args.paper else 'LIVE'}")
     log.info(f"  Risk   : ${args.risk:.2f} / trade")
-    log.info(f"  Trade  : {'YES — ' + outcome if trade_placed else 'NO TRADE'}")
+    log.info(f"  Trade  : {'YES -- ' + outcome if trade_placed else 'NO TRADE'}")
     if trade_placed:
         log.info(f"  Result : {result_r:+.2f}R  (${result_r * args.risk:+.2f})")
     log.info("=" * 65)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Scanning loop  --  KEY FIX: incremental bar fetching, no repeated full pulls
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def run_scanning_loop(
@@ -342,7 +342,7 @@ def run_scanning_loop(
 ) -> Tuple[bool, str, float]:
     """
     Incremental bar fetching strategy to avoid IBKR pacing violations:
-      - First iteration: fetch all bars from market open → now  (one big request)
+      - First iteration: fetch all bars from market open -> now  (one big request)
       - Subsequent iterations: fetch only last 3 minutes of new bars, append
       - Result: 1 large request at start + 1 tiny request every 30s
         instead of 1 large request every 15s (which hits pacing at ~7.5 min)
@@ -350,17 +350,17 @@ def run_scanning_loop(
     today = datetime.now(NY).date()
     today_str = str(today)
 
-    log.info("[SCANNING] Starting incremental scan loop (10:00 → 15:00 NY)...")
+    log.info("[SCANNING] Starting incremental scan loop (10:00 -> 15:00 NY)...")
     log.info("[SCANNING] First fetch: full day bars from market open...")
 
-    # ── Initial full-day fetch ────────────────────────────────────────────────
+    # -- Initial full-day fetch ------------------------------------------------
     scan_end = datetime.now(NY).replace(second=0, microsecond=0)
     all_bars = fetch_bars(
         args.symbol, market_open_dt, scan_end, args.port, client_id=24
     )
 
     if all_bars.empty:
-        log.warning("[SCANNING] Initial bar fetch returned empty — cannot scan.")
+        log.warning("[SCANNING] Initial bar fetch returned empty -- cannot scan.")
         return False, "N/A", 0.0
 
     log.info(f"[SCANNING] Loaded {len(all_bars)} bars for today. Entering scan loop...")
@@ -371,10 +371,16 @@ def run_scanning_loop(
         now = datetime.now(NY)
 
         if now < trade_start_dt:
+            remaining = (trade_start_dt - now).total_seconds()
+            mins = int(remaining // 60)
+            secs = int(remaining % 60)
+            log.info(
+                f"[SCANNING] Waiting for trade window (10:00 NY). {mins}m {secs:02d}s remaining..."
+            )
             time.sleep(30)
             continue
 
-        # ── Incremental fetch: only the last 3 minutes ────────────────────────
+        # -- Incremental fetch: only the last 3 minutes ------------------------
         # This is just 1 tiny request every 30s instead of a full-day request.
         # IBKR counts this as 1 pacing unit regardless of size.
         new_end = now.replace(second=0, microsecond=0)
@@ -391,7 +397,7 @@ def run_scanning_loop(
                 .reset_index(drop=True)
             )
 
-        # ── Run FVG strategy on full day bars ─────────────────────────────────
+        # -- Run FVG strategy on full day bars ---------------------------------
         trades = generate_trades(all_bars, cfg, skip_filters=True)
         today_trades = [t for t in trades if str(t.get("date", "")) == today_str]
 
@@ -430,7 +436,7 @@ def run_scanning_loop(
         )
 
         if parent_id is None:
-            log.error("[SIGNAL] Order placement failed — will not retry same signal.")
+            log.error("[SIGNAL] Order placement failed -- will not retry same signal.")
             time.sleep(30)
             continue
 
@@ -472,7 +478,7 @@ def run_scanning_loop(
 
         return True, outcome, result_r
 
-    log.info("[SCANNING] Session ended — no trade taken today.")
+    log.info("[SCANNING] Session ended -- no trade taken today.")
     record_skip(
         symbol=args.symbol,
         mode="PAPER" if args.paper else "LIVE",
@@ -482,9 +488,9 @@ def run_scanning_loop(
     return False, "N/A", 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -533,7 +539,7 @@ def main() -> None:
     log.info(f"  Script started at: {now_ny.strftime('%H:%M')} NY")
     log.info("=" * 65)
 
-    # ── Weekend guard ──────────────────────────────────────────────────────────
+    # -- Weekend guard ----------------------------------------------------------
     if now_ny.weekday() >= 5:
         log.info(
             f"[WEEKEND] Today is {now_ny.strftime('%A')}. Markets closed. Exiting."
@@ -547,7 +553,7 @@ def main() -> None:
     cutoff_dt = NY.localize(datetime(today.year, today.month, today.day, 15, 0))
     hard_close_dt = NY.localize(datetime(today.year, today.month, today.day, 16, 0))
 
-    # ── Pre-market wait ────────────────────────────────────────────────────────
+    # -- Pre-market wait --------------------------------------------------------
     while datetime.now(NY) < market_open_dt:
         remaining = (market_open_dt - datetime.now(NY)).total_seconds()
         mins = int(remaining // 60)
@@ -559,7 +565,7 @@ def main() -> None:
 
     log.info("[MARKET OPEN] Market is open. Starting warm-up.")
 
-    # ── Warm-up (one request, done once) ──────────────────────────────────────
+    # -- Warm-up (one request, done once) --------------------------------------
     warmup_start = market_open_dt - timedelta(days=args.warmup_days)
     log.info(
         f"[WARM-UP] Fetching {args.warmup_days} days of 1m bars for OR/ATR filters..."
@@ -573,13 +579,13 @@ def main() -> None:
         d_max = pd.to_datetime(warmup_df["timestamp"]).max().date()
         log.info(f"[WARM-UP] {len(warmup_df)} bars loaded ({d_min} to {d_max})")
     else:
-        log.warning("[WARM-UP] No warm-up data — proceeding without filters.")
+        log.warning("[WARM-UP] No warm-up data -- proceeding without filters.")
 
-    # ── Filters (computed ONCE here, never again in the scan loop) ────────────
+    # -- Filters (computed ONCE here, never again in the scan loop) ------------
     log.info("[FILTER] Computing daily OR and ATR filters from warm-up data...")
     q20, q40, atr_threshold, _ = compute_filters(warmup_df, log)
 
-    # ── Wait for opening range to close ───────────────────────────────────────
+    # -- Wait for opening range to close ---------------------------------------
     while datetime.now(NY) < or_end_dt:
         remaining = (or_end_dt - datetime.now(NY)).total_seconds()
         mins = int(remaining // 60)
@@ -591,7 +597,7 @@ def main() -> None:
 
     log.info("[OPENING RANGE] Window closed. Fetching today's OR and ATR...")
 
-    # ── Today's OR ─────────────────────────────────────────────────────────────
+    # -- Today's OR -------------------------------------------------------------
     today_bars = fetch_bars(
         args.symbol, market_open_dt, or_end_dt, args.port, client_id=22
     )
@@ -628,7 +634,7 @@ def main() -> None:
         _session_summary(log, args, trade_placed=False)
         return
 
-    # ── Strategy config ────────────────────────────────────────────────────────
+    # -- Strategy config --------------------------------------------------------
     cfg = FVGConfig(
         tick_size=STRATEGY_CFG.tick_size,
         rr=args.rr,
@@ -642,7 +648,7 @@ def main() -> None:
         use_atr_filter=False,  # filters already applied above
     )
 
-    # ── Scan + trade ───────────────────────────────────────────────────────────
+    # -- Scan + trade -----------------------------------------------------------
     trade_placed, outcome, result_r = run_scanning_loop(
         args, cfg, market_open_dt, trade_start_dt, cutoff_dt, hard_close_dt, log
     )
@@ -654,3 +660,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

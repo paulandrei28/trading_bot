@@ -28,7 +28,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "fvg-dashboard-2026"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# ── Global state ──────────────────────────────────────────────────────────────
+# -- Global state --------------------------------------------------------------
 trader_state: dict = {
     "phase": "IDLE",
     "running": False,
@@ -41,7 +41,7 @@ trader_state: dict = {
 process: subprocess.Popen | None = None
 state_lock = threading.Lock()
 
-# ── Phase → step mapping ──────────────────────────────────────────────────────
+# -- Phase -> step mapping --------------------------------------------------
 TAG_TO_PHASE = {
     "PRE-MARKET": "PRE-MARKET",
     "MARKET OPEN": "WARM-UP",
@@ -61,7 +61,7 @@ TAG_TO_PHASE = {
 }
 
 
-# ── Log parser ────────────────────────────────────────────────────────────────
+# -- Log parser ----------------------------------------------------------------
 def parse_log_line(line: str) -> dict:
     updates: dict = {}
 
@@ -100,7 +100,7 @@ def parse_log_line(line: str) -> dict:
         updates["or_low"] = float(m.group(2))
         updates["or_width"] = float(m.group(3))
 
-    # Signal detected — entry/stop/target
+    # Signal detected -- entry/stop/target
     m = re.search(
         r"\[SIGNAL\] Setup detected -- (\w+) at (\d+:\d+).*?"
         r"entry=([\d.]+)\s+stop=([\d.]+)\s+target=([\d.]+)",
@@ -137,7 +137,7 @@ def parse_log_line(line: str) -> dict:
             "target_gain": float(m.group(4)),
         }
 
-    # Order placed → trade active
+    # Order placed -> trade active
     if "[ORDER] Bracket placed" in line:
         updates["trade_status"] = "ACTIVE"
         updates["trade_start_ts"] = datetime.now().isoformat()
@@ -146,7 +146,7 @@ def parse_log_line(line: str) -> dict:
     if "[MONITORING] Trade is live" in line:
         updates["trade_status"] = "ACTIVE"
 
-    # Target hit → WIN
+    # Target hit -> WIN
     m = re.search(r"\[RESULT\] TARGET HIT -- \+([\d.]+)R\s+\+\$([\d.]+)", line)
     if m:
         updates["trade_result"] = {
@@ -155,7 +155,7 @@ def parse_log_line(line: str) -> dict:
             "pnl_usd": float(m.group(2)),
         }
 
-    # Stop hit → LOSS
+    # Stop hit -> LOSS
     m = re.search(r"\[RESULT\] STOP HIT -- (-?[\d.]+)R\s+\$(-?[\d.]+)", line)
     if m:
         updates["trade_result"] = {
@@ -167,7 +167,7 @@ def parse_log_line(line: str) -> dict:
     return updates
 
 
-# ── Trader subprocess thread ───────────────────────────────────────────────────
+# -- Trader subprocess thread ---------------------------------------------------
 def run_trader_thread(config: dict) -> None:
     global process, trader_state
 
@@ -268,7 +268,7 @@ def run_trader_thread(config: dict) -> None:
         socketio.emit("trader_stopped", {})
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# -- Routes --------------------------------------------------------------------
 @app.route("/")
 def index():
     html_path = os.path.join(
@@ -278,7 +278,7 @@ def index():
         return f.read()
 
 
-# ── Socket events ─────────────────────────────────────────────────────────────
+# -- Socket events -------------------------------------------------------------
 @socketio.on("start_trader")
 def handle_start(config):
     if not trader_state["running"]:
@@ -302,7 +302,7 @@ def handle_get_state():
     emit("state_update", dict(trader_state))
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# -- Entry point ---------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 60)
     print("  FVG Live Trader  --  Dashboard")

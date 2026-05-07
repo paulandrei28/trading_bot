@@ -28,11 +28,11 @@ class IBKRExecutionClient:
         self.port = port
         self.client_id = client_id
         self.ib = IB()
-        self._trades: dict[int, Trade] = {}  # parent_id → Trade
+        self._trades: dict[int, Trade] = {}  # parent_id -> Trade
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Connection
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def connect(self) -> None:
         if not self.ib.isConnected():
@@ -44,9 +44,9 @@ class IBKRExecutionClient:
             self.ib.disconnect()
             log.debug("[EXEC] Disconnected.")
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Bracket order
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def place_bracket_order(
         self,
@@ -72,18 +72,18 @@ class IBKRExecutionClient:
 
         reverse = "SELL" if action == "BUY" else "BUY"
 
-        # ── Parent: limit entry ───────────────────────────────────
+        # -- Parent: limit entry -----------------------------------
         parent = LimitOrder(action, quantity, round(entry_price, 2))
         parent.orderId = self.ib.client.getReqId()
         parent.transmit = False  # hold until children attached
 
-        # ── Child 1: stop loss ───────────────────────────────────
+        # -- Child 1: stop loss -----------------------------------
         stop = StopOrder(reverse, quantity, round(stop_price, 2))
         stop.orderId = self.ib.client.getReqId()
         stop.parentId = parent.orderId
         stop.transmit = False
 
-        # ── Child 2: profit target ────────────────────────────────
+        # -- Child 2: profit target --------------------------------
         target = LimitOrder(reverse, quantity, round(target_price, 2))
         target.orderId = self.ib.client.getReqId()
         target.parentId = parent.orderId
@@ -101,14 +101,14 @@ class IBKRExecutionClient:
         self._trades[parent.orderId] = parent_trade
         log.info(
             f"[EXEC] Bracket placed | parentId={parent.orderId} "
-            f"{action} {quantity}×{symbol} "
+            f"{action} {quantity}x{symbol} "
             f"entry={entry_price:.2f}  stop={stop_price:.2f}  target={target_price:.2f}"
         )
         return parent.orderId
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Order status & fill price
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def get_order_status(self, parent_id: int) -> str:
         """
@@ -121,7 +121,7 @@ class IBKRExecutionClient:
         for trade in trades:
             if trade.order.orderId == parent_id:
                 return trade.orderStatus.status
-        # Also check child orders — if a child (stop or target) filled,
+        # Also check child orders -- if a child (stop or target) filled,
         # the bracket is done.
         for trade in trades:
             if trade.order.parentId == parent_id:
@@ -144,9 +144,9 @@ class IBKRExecutionClient:
                 return float(trade.orderStatus.avgFillPrice)
         return None
 
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
     # Hard close
-    # ──────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------
 
     def cancel_all_children(self, parent_id: int) -> None:
         """
@@ -182,7 +182,7 @@ class IBKRExecutionClient:
         # Flatten residual position with a MKT order
         if filled_action and qty > 0:
             close_action = "SELL" if filled_action == "BUY" else "BUY"
-            # Reconstruct contract — pull from any trade with this parent
+            # Reconstruct contract -- pull from any trade with this parent
             contract = None
             for trade in self.ib.trades():
                 if (
@@ -203,4 +203,4 @@ class IBKRExecutionClient:
                     f"[EXEC] Market close sent: {close_action} {qty} to flatten position."
                 )
 
-        log.info(f"[EXEC] Hard close complete — {cancelled} child(ren) cancelled.")
+        log.info(f"[EXEC] Hard close complete -- {cancelled} child(ren) cancelled.")

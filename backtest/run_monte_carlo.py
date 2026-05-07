@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from backtest.monte_carlo import run_monte_carlo, summarize
 
 # ----------------------------------------
-# Settings — edit as needed
+# Settings -- edit as needed
 # ----------------------------------------
 TRADES_CSV = ""  # leave empty to auto-pick latest from logs/
 SYMBOL = "QQQ"

@@ -35,7 +35,7 @@ def run_monte_carlo(
     - without replacement: random permutation (same trades, different order)
     """
     if len(results_r) == 0:
-        raise ValueError("results_r is empty — nothing to simulate")
+        raise ValueError("results_r is empty -- nothing to simulate")
 
     rng = np.random.default_rng(seed)
     n = len(results_r)
