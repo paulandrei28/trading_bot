@@ -1,3 +1,4 @@
+import logging
 import warnings
 import pandas as pd
 import pytz
@@ -5,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 
 NY = pytz.timezone("America/New_York")
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -101,8 +103,8 @@ def _build_daily_filters(df: pd.DataFrame, cfg: "FVGConfig") -> dict:
     or_hi = combined["or_width"].quantile(cfg.or_skip_pct_high)
     atr_th = combined["atr_14"].quantile(cfg.atr_min_pct)
 
-    print(f"[FILTER] OR skip band:     ({or_lo:.3f}, {or_hi:.3f}]")
-    print(f"[FILTER] ATR min threshold: {atr_th:.3f}")
+    _log.info(f"[FILTER] OR skip band:     ({or_lo:.3f}, {or_hi:.3f}]")
+    _log.info(f"[FILTER] ATR min threshold: {atr_th:.3f}")
 
     day_filter = {}
     skipped_or = skipped_atr = 0
@@ -119,12 +121,14 @@ def _build_daily_filters(df: pd.DataFrame, cfg: "FVGConfig") -> dict:
         day_filter[date] = {"or_ok": or_ok, "atr_ok": atr_ok}
 
     total = len(combined)
-    print(f"[FILTER] OR  skipped: {skipped_or}/{total} days")
-    print(f"[FILTER] ATR skipped: {skipped_atr}/{total} days")
+    _log.info(f"[FILTER] OR  skipped: {skipped_or}/{total} days")
+    _log.info(f"[FILTER] ATR skipped: {skipped_atr}/{total} days")
     return day_filter
 
 
-def generate_trades(df: pd.DataFrame, cfg: FVGConfig = FVGConfig()) -> List[Dict]:
+def generate_trades(
+    df: pd.DataFrame, cfg: FVGConfig = FVGConfig(), skip_filters: bool = False
+) -> List[Dict]:
     """
     Opening range breakout + FVG retest + engulfing confirmation.
     Fixed RR (default 3:1). Outcomes: WIN / LOSS / BE.
@@ -133,11 +137,16 @@ def generate_trades(df: pd.DataFrame, cfg: FVGConfig = FVGConfig()) -> List[Dict
       1. Time window  : entries only trade_start <= t < cutoff_time
       2. OR skip band : skip days where OR width is in the Q2 percentile band
       3. ATR floor    : skip days where ATR(14) < atr_min_pct percentile
+
+    Set skip_filters=True when calling from live_trader (filters already applied).
     """
     if df is None or df.empty:
         return []
 
-    day_filter = _build_daily_filters(df, cfg)
+    if skip_filters:
+        day_filter = {}  # all days pass — filters handled externally
+    else:
+        day_filter = _build_daily_filters(df, cfg)
 
     df = df.copy()
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -276,5 +285,7 @@ def generate_trades(df: pd.DataFrame, cfg: FVGConfig = FVGConfig()) -> List[Dict
             if trade_taken and cfg.one_trade_per_day:
                 break
 
-    print(f"[FILTER] Days traded: {days_traded} | Days filtered out: {days_filtered}")
+    _log.info(
+        f"[FILTER] Days traded: {days_traded} | Days filtered out: {days_filtered}"
+    )
     return trades

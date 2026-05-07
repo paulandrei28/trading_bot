@@ -27,6 +27,7 @@ import pytz
 
 from strategy.fvg_strategy import FVGConfig, generate_trades
 from tws.ib_history import IBKRHistoryClient, IBHistoryConfig
+from daily_journal import record_skip, record_trade_open, record_trade_result
 
 NY = pytz.timezone("America/New_York")
 
@@ -391,7 +392,7 @@ def run_scanning_loop(
             )
 
         # ── Run FVG strategy on full day bars ─────────────────────────────────
-        trades = generate_trades(all_bars, cfg)
+        trades = generate_trades(all_bars, cfg, skip_filters=True)
         today_trades = [t for t in trades if str(t.get("date", "")) == today_str]
 
         if not today_trades:
@@ -433,6 +434,21 @@ def run_scanning_loop(
             time.sleep(30)
             continue
 
+        # Journal: trade opened
+        mode_str = "PAPER" if args.paper else "LIVE"
+        entry_time_str = str(sig_time)[-8:-3] if sig_time else ""
+        record_trade_open(
+            symbol=args.symbol,
+            mode=mode_str,
+            started_at=datetime.now(NY).strftime("%H:%M"),
+            direction=direction,
+            entry_time=entry_time_str,
+            entry=entry,
+            stop=stop_px,
+            target=target,
+            qty=qty,
+        )
+
         outcome, result_r = monitor_open_trade(
             parent_id,
             direction,
@@ -444,9 +460,25 @@ def run_scanning_loop(
             args.port,
             log,
         )
+
+        # Journal: trade result
+        pnl_usd = round(result_r * qty * risk, 2)
+        record_trade_result(
+            symbol=args.symbol,
+            result=outcome,
+            result_r=result_r,
+            pnl_usd=pnl_usd,
+        )
+
         return True, outcome, result_r
 
     log.info("[SCANNING] Session ended — no trade taken today.")
+    record_skip(
+        symbol=args.symbol,
+        mode="PAPER" if args.paper else "LIVE",
+        reason="No signal detected",
+        started_at=datetime.now(NY).strftime("%H:%M"),
+    )
     return False, "N/A", 0.0
 
 
@@ -456,16 +488,36 @@ def run_scanning_loop(
 
 
 def main() -> None:
+    from config import (
+        SYMBOL,
+        RISK_DOLLARS,
+        IB_PORT,
+        TRADING_MODE,
+        WARMUP_DAYS,
+        STRATEGY_CFG,
+    )
+
     parser = argparse.ArgumentParser(description="FVG Live Trader")
-    parser.add_argument("--symbol", default="QQQ")
-    parser.add_argument("--port", type=int, default=7497)
-    parser.add_argument("--risk", type=float, default=100.0)
-    parser.add_argument("--rr", type=float, default=3.0)
-    parser.add_argument("--paper", action="store_true")
-    parser.add_argument("--warmup-days", type=int, default=30)
+    parser.add_argument("--symbol", default=SYMBOL)
+    parser.add_argument("--port", type=int, default=IB_PORT)
+    parser.add_argument("--risk", type=float, default=RISK_DOLLARS)
+    parser.add_argument("--rr", type=float, default=STRATEGY_CFG.rr)
+    parser.add_argument(
+        "--live", action="store_true", help="Use live trading port (7496)"
+    )
+    parser.add_argument("--paper", action="store_true", help="Force paper mode (7497)")
+    parser.add_argument("--warmup-days", type=int, default=WARMUP_DAYS)
     args = parser.parse_args()
 
-    paper = args.paper or (args.port == 7497)
+    # --live overrides port; --paper overrides --live; default is paper
+    if args.live and not args.paper:
+        args.port = 7496
+    elif args.paper:
+        args.port = 7497
+
+    paper = args.port == 7497
+    args.paper = paper  # normalize for downstream use
+
     log = setup_logging(args.symbol, paper)
     now_ny = datetime.now(NY)
     today = now_ny.date()
@@ -557,19 +609,37 @@ def main() -> None:
 
     if should_skip_day(or_width_today, atr_today, q20, q40, atr_threshold, log):
         log.info("[SESSION END] Day filtered. No trades today.")
+        or_f = "SKIP" if (q20 is not None and q20 < or_width_today <= q40) else "PASS"
+        atr_f = (
+            "SKIP"
+            if (atr_threshold and atr_today and atr_today < atr_threshold)
+            else "PASS"
+        )
+        record_skip(
+            symbol=args.symbol,
+            mode="PAPER" if paper else "LIVE",
+            reason=f"OR={or_f} ATR={atr_f}",
+            started_at=now_ny.strftime("%H:%M"),
+            or_filter=or_f,
+            atr_filter=atr_f,
+            or_width=or_width_today,
+            atr_14=atr_today,
+        )
         _session_summary(log, args, trade_placed=False)
         return
 
     # ── Strategy config ────────────────────────────────────────────────────────
     cfg = FVGConfig(
-        tick_size=0.01,
+        tick_size=STRATEGY_CFG.tick_size,
         rr=args.rr,
-        session_start="09:30",
-        opening_end="09:35",
-        trade_start="10:00",
-        cutoff_time="15:00",
-        one_trade_per_day=True,
-        retest_mode="close",
+        session_start=STRATEGY_CFG.session_start,
+        opening_end=STRATEGY_CFG.opening_end,
+        trade_start=STRATEGY_CFG.trade_start,
+        cutoff_time=STRATEGY_CFG.cutoff_time,
+        one_trade_per_day=STRATEGY_CFG.one_trade_per_day,
+        retest_mode=STRATEGY_CFG.retest_mode,
+        use_or_filter=False,  # filters already applied above
+        use_atr_filter=False,  # filters already applied above
     )
 
     # ── Scan + trade ───────────────────────────────────────────────────────────

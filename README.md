@@ -1,31 +1,34 @@
-# Trading Backtest Project
+# FVG Trading Bot
 
-Minimal cleaned version of the project for:
-- running the backtest
-- generating reports
-- running Monte Carlo analysis
-- testing Interactive Brokers / Trader Workstation connectivity
-- fetching historical data from IBKR
+Automated FVG (Fair Value Gap) breakout trading system for Interactive Brokers.
+Supports paper and live trading with configurable filters and risk management.
+
+## Features
+
+- Opening range breakout + FVG retest + engulfing confirmation
+- OR width and ATR(14) day filters (skip low-quality days)
+- Bracket order execution (entry + stop + target)
+- Daily journal CSV (auto-logged every session)
+- Web dashboard for monitoring (Flask + Socket.IO)
+- Backtest engine with Monte Carlo analysis
 
 ## Project structure
 
-- `strategy/fvg_strategy.py` - strategy logic and config
+- `config.py` - **single source of truth** for all trading parameters
+- `live_trader.py` - live/paper trading engine
+- `daily_journal.py` - append-only daily trade journal
+- `dashboard_app.py` + `dashboard.html` - web monitoring dashboard
+- `strategy/fvg_strategy.py` - strategy logic and config dataclass
 - `backtest/backtest.py` - backtest entry point
 - `backtest/test_backtest.py` - main backtest test runner
 - `backtest/metrics.py` - performance metrics
-- `backtest/analysis.py` - extra analysis outputs
+- `backtest/analysis.py` - time/volatility analysis
 - `backtest/monte_carlo.py` - Monte Carlo engine
 - `backtest/run_monte_carlo.py` - Monte Carlo runner
-- `tws/ib_api.py` - basic TWS order API client
-- `tws/ib_history.py` - IBKR historical data downloader
-- `tws/test_ibkr.py` - TWS connectivity and paper-order test
-- `data/SPY_1m_2025-03-04_2026-03-04_ibkr.csv` - sample dataset
+- `tws/ib_execution.py` - bracket order placement and monitoring (ib_insync)
+- `tws/ib_history.py` - IBKR historical data downloader (ib_insync)
 
 ## Setup
-
-Create and activate a virtual environment.
-
-### Windows
 
 ```bash
 python -m venv .venv
@@ -33,50 +36,64 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run the backtest test
+## Paper Trading
 
-From the project root:
+1. Open TWS and log in to your **paper trading** account
+2. Enable API access (port 7497)
+3. Run:
+
+```bash
+python live_trader.py
+```
+
+Or with custom options:
+
+```bash
+python live_trader.py --symbol SPY --risk 200 --rr 3.0
+```
+
+All parameters default from `config.py`. The bot will:
+- Wait for market open (09:30 NY)
+- Fetch warm-up data for filter computation
+- Apply OR/ATR filters for the day
+- Scan for FVG signals (10:00–15:00 NY)
+- Place bracket orders automatically
+- Log results to `logs/daily_journal.csv`
+
+## Live Trading
+
+```bash
+python live_trader.py --live
+```
+
+Or set `TRADING_MODE = "live"` in `config.py`.
+
+## Web Dashboard
+
+```bash
+python dashboard_app.py
+# Open http://localhost:5000
+```
+
+## Run Backtest
 
 ```bash
 python -m backtest.test_backtest
 ```
 
-This will:
-- load the latest matching `SPY` dataset from `data/`
-- run the strategy backtest
-- create output files inside `logs/`
-- print a summary report in the console
-
-## Run Monte Carlo on saved trades
-
-After generating a trades file in `logs/`, run:
+## Run Monte Carlo
 
 ```bash
-python -m backtest.run_monte_carlo logs/trades_SPY_2025-03-04_2026-03-04.csv 10000
+python -m backtest.run_monte_carlo
 ```
 
-## Using Trader Workstation (TWS)
+## TWS Configuration
 
-### 1. Install and open TWS
-Use the paper trading account if you want to test safely.
-
-### 2. Enable API access in TWS
 In Trader Workstation:
-
-- `File` -> `Global Configuration`
-- `API` -> `Settings`
-- enable `Enable ActiveX and Socket Clients`
-- keep the socket port as:
-  - `7497` for Paper Trading
-  - `7496` for Live Trading
-- optionally add `127.0.0.1` to trusted IPs
-
-### 3. Test TWS connection
-With TWS open and logged in:
-
-```bash
-python tws/test_ibkr.py
-```
+- `File` → `Global Configuration` → `API` → `Settings`
+- Enable `Enable ActiveX and Socket Clients`
+- Port `7497` for Paper, `7496` for Live
+- Add `127.0.0.1` to trusted IPs
 
 This script connects to TWS on `127.0.0.1:7497` and submits a paper-test bracket order example.
 Use only on paper trading unless you intentionally change it.
