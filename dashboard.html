@@ -567,7 +567,8 @@ function updTrade(t){
     rEl.textContent=(isW?'+':'')+t.result_r+'R';
     rEl.className='rr '+(isW?'win':'loss');
     const uEl=document.getElementById('rusd-val');
-    uEl.textContent=(isW?'+':'')+'$'+Math.abs(t.pnl_usd||0).toFixed(2);
+    const pnl=t.pnl_usd||(t.max_loss&&t.result_r?(t.result_r>0?t.target_gain:-t.max_loss):0);
+    uEl.textContent=(isW?'+':'-')+'$'+Math.abs(pnl||0).toFixed(2);
     uEl.style.color=isW?'var(--green)':'var(--red)';
     document.getElementById('rlbl').textContent=isW?'Target Hit':'Stop Hit';
     if(tTimer){clearInterval(tTimer);tTimer=null}

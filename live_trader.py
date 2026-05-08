@@ -179,7 +179,9 @@ def should_skip_day(
     atr_str = f"{atr_today:.3f}" if atr_today is not None else "N/A"
 
     if skip_or:
-        log.info(f"[FILTER] SKIP -- OR {or_width:.3f} in Q2 band ({q20:.3f}, {q40:.3f}]")
+        log.info(
+            f"[FILTER] SKIP -- OR {or_width:.3f} in Q2 band ({q20:.3f}, {q40:.3f}]"
+        )
         return True
     if skip_atr:
         log.info(f"[FILTER] SKIP -- ATR {atr_str} < threshold {atr_threshold:.3f}")
@@ -660,4 +662,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

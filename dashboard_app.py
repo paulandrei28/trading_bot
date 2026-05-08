@@ -48,8 +48,7 @@ TAG_TO_PHASE = {
     "WARM-UP": "WARM-UP",
     "FILTER": "FILTER",
     "OPENING RANGE": "OPENING RANGE",
-    "TRADE WINDOW": "SCANNING",
-    "SCAN": "SCANNING",
+    "SCANNING": "SCANNING",
     "SIGNAL": "SIGNAL FOUND",
     "ORDER": "ORDER PLACED",
     "MONITORING": "IN TRADE",
@@ -57,7 +56,6 @@ TAG_TO_PHASE = {
     "SESSION END": "SESSION END",
     "SESSION SUMMARY": "SESSION END",
     "WEEKEND": "WEEKEND",
-    "LATE START": "SESSION END",
 }
 
 
@@ -72,96 +70,73 @@ def parse_log_line(line: str) -> dict:
             break
 
     # OR filter
-    if "OR filter PASS" in line:
+    if "[FILTER] PASS" in line:
         updates["or_filter"] = "PASS"
-    elif ("TODAY SKIPPED" in line and "OR" in line) or "OR filter SKIP" in line:
-        updates["or_filter"] = "SKIP"
-
-    # ATR filter
-    if "ATR filter PASS" in line:
         updates["atr_filter"] = "PASS"
-    elif ("TODAY SKIPPED" in line and "ATR" in line) or "ATR filter SKIP" in line:
+    elif "[FILTER] SKIP -- OR" in line:
+        updates["or_filter"] = "SKIP"
+    elif "[FILTER] SKIP -- ATR" in line:
         updates["atr_filter"] = "SKIP"
 
-    # OR width
-    m = re.search(r"OR width today[:\s]+([\d.]+)", line)
+    # OR width + ATR from "Today OR=... ATR=..."
+    m = re.search(r"Today OR=([\d.]+)\s+ATR=([\d.]+|N/A)", line)
     if m:
         updates["or_width"] = float(m.group(1))
+        if m.group(2) != "N/A":
+            updates["atr_value"] = float(m.group(2))
 
-    # ATR value
-    m = re.search(r"ATR today[:\s]+([\d.]+)", line)
-    if m:
-        updates["atr_value"] = float(m.group(1))
-
-    # OR computed high/low
-    m = re.search(r"Computed -- high=([\d.]+)\s+low=([\d.]+)\s+width=([\d.]+)", line)
-    if m:
-        updates["or_high"] = float(m.group(1))
-        updates["or_low"] = float(m.group(2))
-        updates["or_width"] = float(m.group(3))
-
-    # Signal detected -- entry/stop/target
+    # Signal detected -- entry/stop/target/qty/risk
     m = re.search(
-        r"\[SIGNAL\] Setup detected -- (\w+) at (\d+:\d+).*?"
-        r"entry=([\d.]+)\s+stop=([\d.]+)\s+target=([\d.]+)",
+        r"\[SIGNAL\] (\w+) @ ([\d.]+) \| stop=([\d.]+)\s+target=([\d.]+) \| "
+        r"qty=(\d+)\s+risk=\$([\d.]+)\s+target=\$([\d.]+)",
         line,
     )
     if m:
+        direction = m.group(1)
+        entry_px = float(m.group(2))
+        stop_px = float(m.group(3))
+        target_px = float(m.group(4))
+        qty = int(m.group(5))
+        max_loss = float(m.group(6))
+        target_gain = float(m.group(7))
+        now_str = datetime.now().strftime("%H:%M")
         updates["trade"] = {
-            "direction": m.group(1),
-            "entry_time": m.group(2),
-            "entry": float(m.group(3)),
-            "stop": float(m.group(4)),
-            "target": float(m.group(5)),
+            "direction": direction,
+            "entry_time": now_str,
+            "entry": entry_px,
+            "stop": stop_px,
+            "target": target_px,
             "status": "SIGNAL",
             "outcome": None,
             "result_r": None,
             "pnl_usd": None,
-            "qty": None,
-            "max_loss": None,
-            "target_gain": None,
+            "qty": qty,
+            "max_loss": max_loss,
+            "target_gain": target_gain,
             "start_ts": None,
         }
 
-    # Risk / qty line
-    m = re.search(
-        r"\[SIGNAL\] Risk: \$([\d.]+)/share\s+Qty: (\d+)\s+"
-        r"Max loss: \$([\d.]+)\s+Target gain: \$([\d.]+)",
-        line,
-    )
-    if m:
-        updates["trade_partial"] = {
-            "risk_per_share": float(m.group(1)),
-            "qty": int(m.group(2)),
-            "max_loss": float(m.group(3)),
-            "target_gain": float(m.group(4)),
-        }
-
     # Order placed -> trade active
-    if "[ORDER] Bracket placed" in line:
+    if "[ORDER] Bracket submitted" in line:
         updates["trade_status"] = "ACTIVE"
         updates["trade_start_ts"] = datetime.now().isoformat()
 
-    # Monitoring confirmation
-    if "[MONITORING] Trade is live" in line:
+    # Monitoring active
+    if "[MONITORING] Watching" in line:
         updates["trade_status"] = "ACTIVE"
 
-    # Target hit -> WIN
-    m = re.search(r"\[RESULT\] TARGET HIT -- \+([\d.]+)R\s+\+\$([\d.]+)", line)
+    # Result -- WIN / LOSS / BE
+    m = re.search(
+        r"\[RESULT\] (\w+)\s+result_r=([+-]?[\d.]+)R\s+fill=([\d.]+|None)",
+        line,
+    )
     if m:
+        outcome = m.group(1)
+        result_r = float(m.group(2))
         updates["trade_result"] = {
-            "outcome": "WIN",
-            "result_r": float(m.group(1)),
-            "pnl_usd": float(m.group(2)),
-        }
-
-    # Stop hit -> LOSS
-    m = re.search(r"\[RESULT\] STOP HIT -- (-?[\d.]+)R\s+\$(-?[\d.]+)", line)
-    if m:
-        updates["trade_result"] = {
-            "outcome": "LOSS",
-            "result_r": float(m.group(1)),
-            "pnl_usd": float(m.group(2)),
+            "outcome": outcome,
+            "result_r": result_r,
+            "pnl_usd": None,  # computed client-side from qty * risk
         }
 
     return updates
@@ -229,15 +204,11 @@ def run_trader_thread(config: dict) -> None:
                         "atr_filter",
                         "or_width",
                         "atr_value",
-                        "or_high",
-                        "or_low",
                     ):
                         if key in updates:
                             trader_state[key] = updates[key]
                     if "trade" in updates:
                         trader_state["trade"] = updates["trade"]
-                    if "trade_partial" in updates and trader_state.get("trade"):
-                        trader_state["trade"].update(updates["trade_partial"])
                     if "trade_status" in updates and trader_state.get("trade"):
                         trader_state["trade"]["status"] = updates["trade_status"]
                     if "trade_start_ts" in updates and trader_state.get("trade"):
